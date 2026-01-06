@@ -1,0 +1,728 @@
+\documentclass[11pt,a4paper]{article}
+
+% ============================================================================
+% PACKAGES
+% ============================================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{float}
+
+\geometry{margin=1in}
+
+% ============================================================================
+% CUSTOM COMMANDS
+% ============================================================================
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\text{Var}}
+\newcommand{\Cov}{\text{Cov}}
+\newcommand{\Corr}{\text{Corr}}
+\newcommand{\tr}{\text{tr}}
+\newcommand{\diag}{\text{diag}}
+\newcommand{\argmin}{\mathop{\text{argmin}}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+% ============================================================================
+% TITLE
+% ============================================================================
+\title{\textbf{Hierarchical Risk Parity (HRP) Portfolio Optimization}\\[0.5em]
+\large A Detailed Methodology for GPU-Accelerated Implementation\\with Non-Linear Covariance Shrinkage}
+
+\author{HRP Research Pipeline Documentation}
+\date{January 2025}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a comprehensive technical description of the Hierarchical Risk Parity (HRP) portfolio optimization methodology implemented in our research pipeline. We detail the complete workflow from raw CRSP data ingestion through universe construction, covariance estimation with Random Matrix Theory (RMT) denoising, hierarchical clustering, quasi-diagonalization, and recursive bisection for weight allocation. The implementation leverages GPU acceleration via CUDA/CuPy for computationally intensive operations while maintaining numerical stability through robust shrinkage estimators.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+% SECTION 1: INTRODUCTION
+% ============================================================================
+\section{Introduction}
+
+\subsection{Motivation}
+
+Traditional mean-variance optimization, introduced by \citet{markowitz1952}, suffers from several well-documented limitations:
+\begin{enumerate}[label=(\roman*)]
+    \item \textbf{Estimation Error Sensitivity}: Small changes in expected returns or covariances lead to dramatically different allocations.
+    \item \textbf{Concentration Risk}: Optimizers tend to concentrate holdings in a few assets.
+    \item \textbf{Covariance Matrix Instability}: Sample covariance matrices are notoriously noisy, especially when the number of assets $N$ approaches or exceeds the sample size $T$.
+\end{enumerate}
+
+Hierarchical Risk Parity (HRP), introduced by \citet{lopez2016building}, addresses these issues by:
+\begin{itemize}
+    \item Eliminating the need for expected return estimates (risk-parity philosophy)
+    \item Using hierarchical clustering to identify natural groupings in the asset universe
+    \item Allocating capital through recursive bisection, respecting the cluster structure
+\end{itemize}
+
+\subsection{Pipeline Overview}
+
+Our HRP implementation follows a seven-stage pipeline:
+\begin{enumerate}
+    \item \textbf{Data Ingestion}: Load CRSP stock returns with proper handling of delisting returns
+    \item \textbf{Universe Construction}: Apply liquidity and price filters using Fama-French industry classification
+    \item \textbf{Covariance Estimation}: Compute robust covariance using RMT denoising
+    \item \textbf{Distance Computation}: Transform correlation to distance metric (GPU-accelerated)
+    \item \textbf{Hierarchical Clustering}: Ward's method on Euclidean distance matrix
+    \item \textbf{Quasi-Diagonalization}: Seriation to reorder assets by cluster proximity
+    \item \textbf{Recursive Bisection}: Allocate weights inversely proportional to cluster variance
+\end{enumerate}
+
+% ============================================================================
+% SECTION 2: DATA INGESTION AND PREPROCESSING
+% ============================================================================
+\section{Data Ingestion and Preprocessing}
+
+\subsection{CRSP Data Structure}
+
+We utilize the Center for Research in Security Prices (CRSP) monthly stock file, which provides:
+\begin{itemize}
+    \item \texttt{PERMNO}: Permanent security identifier
+    \item \texttt{DATE}: End-of-month date
+    \item \texttt{RET}: Monthly holding period return
+    \item \texttt{DLRET}: Delisting return (if applicable)
+    \item \texttt{PRC}: End-of-month price (negative if bid-ask midpoint)
+    \item \texttt{VOL}: Monthly trading volume (in shares)
+    \item \texttt{SHROUT}: Shares outstanding (in thousands)
+    \item \texttt{SHRCD}: Share code (security type)
+    \item \texttt{EXCHCD}: Exchange code
+    \item \texttt{SICCD}: Standard Industrial Classification code
+\end{itemize}
+
+\subsection{Return Calculation with Delisting Adjustment}
+
+A critical but often overlooked step is the proper handling of delisting returns. When a stock delists (due to bankruptcy, merger, or going private), the final return is captured in \texttt{DLRET}. We compute total returns as:
+
+\begin{equation}
+R_t^{\text{total}} = (1 + R_t^{\text{RET}}) \times (1 + R_t^{\text{DLRET}}) - 1
+\label{eq:total_return}
+\end{equation}
+
+where $R_t^{\text{RET}}$ is the standard holding period return and $R_t^{\text{DLRET}}$ is the delisting return. If \texttt{RET} is missing but \texttt{DLRET} is available, we set $R_t^{\text{RET}} = 0$ before compounding.
+
+\begin{remark}
+Ignoring delisting returns introduces survivorship bias and can overstate historical performance by 50-100 basis points annually, as documented in \citet{shumway1997delisting}.
+\end{remark}
+
+\subsection{Share Code and Exchange Filters}
+
+We restrict our universe to common stocks traded on major U.S. exchanges:
+
+\begin{align}
+\texttt{SHRCD} &\in \{10, 11\} \quad \text{(Common shares)} \\
+\texttt{EXCHCD} &\in \{1, 2, 3\} \quad \text{(NYSE, AMEX, NASDAQ)}
+\end{align}
+
+This excludes ADRs, REITs, closed-end funds, and other non-standard securities that may have different risk characteristics.
+
+% ============================================================================
+% SECTION 3: UNIVERSE CONSTRUCTION
+% ============================================================================
+\section{Universe Construction}
+
+\subsection{Liquidity Measurement}
+
+We define liquidity as the dollar trading volume:
+\begin{equation}
+\text{Liquidity}_{i,t} = \text{VOL}_{i,t} \times 100 \times |P_{i,t}|
+\label{eq:liquidity}
+\end{equation}
+
+where \texttt{VOL} is reported in hundreds of shares and $|P_{i,t}|$ is the absolute price (CRSP reports negative prices for bid-ask midpoints).
+
+\subsection{Fama-French Industry Classification}
+
+To ensure industry diversification in our liquidity filter, we map each stock to one of the Fama-French 12 industry classifications using SIC codes. The mapping follows the standard Fama-French definitions:
+
+\begin{table}[H]
+\centering
+\caption{Fama-French 12 Industry Classification}
+\begin{tabular}{cl}
+\toprule
+\textbf{FF12 Code} & \textbf{Industry} \\
+\midrule
+1 & Consumer Non-Durables \\
+2 & Consumer Durables \\
+3 & Manufacturing \\
+4 & Energy \\
+5 & Chemicals \\
+6 & Business Equipment \\
+7 & Telecommunications \\
+8 & Utilities \\
+9 & Shops (Retail) \\
+10 & Healthcare \\
+11 & Finance \\
+12 & Other \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Rolling Median Liquidity Filter}
+
+To avoid look-ahead bias and reduce turnover, we compute a 12-month rolling median of liquidity:
+\begin{equation}
+\widetilde{\text{Liq}}_{i,t} = \text{median}\left(\text{Liq}_{i,t-11}, \text{Liq}_{i,t-10}, \ldots, \text{Liq}_{i,t}\right)
+\label{eq:rolling_liq}
+\end{equation}
+
+\begin{remark}
+The rolling median requires a minimum of 6 observations (out of 12) to compute a valid value, allowing stocks with shorter history to enter the universe while still providing robust liquidity estimates.
+\end{remark}
+
+\subsection{Industry-Relative Liquidity Threshold}
+
+For each industry $j$ at time $t$, we compute the 80th percentile of rolling median liquidity:
+\begin{equation}
+\tau_{j,t} = Q_{0.80}\left(\{\widetilde{\text{Liq}}_{i,t} : i \in \text{Industry } j\}\right)
+\label{eq:threshold}
+\end{equation}
+
+A stock enters the universe if:
+\begin{equation}
+\text{Universe}_{i,t} = \mathbf{1}\left[\widetilde{\text{Liq}}_{i,t} \geq \tau_{j(i),t}\right] \times \mathbf{1}\left[|P_{i,t}| > \$3\right]
+\label{eq:universe_flag}
+\end{equation}
+
+where $j(i)$ denotes the industry of stock $i$, and the price filter excludes penny stocks that may have extreme bid-ask spreads.
+
+\begin{remark}
+The industry-relative filter ensures that we select the most liquid stocks \emph{within each industry}, preventing the portfolio from being dominated by highly liquid sectors (e.g., technology, finance) at the expense of less liquid but economically important sectors (e.g., utilities, energy).
+\end{remark}
+
+% ============================================================================
+% SECTION 4: COVARIANCE ESTIMATION
+% ============================================================================
+\section{Covariance Estimation with RMT Denoising}
+
+\subsection{The Curse of Dimensionality}
+
+When estimating an $N \times N$ covariance matrix from $T$ observations, the sample covariance matrix $\hat{\Sigma}$ contains $N(N+1)/2$ unique parameters. For typical portfolios where $N$ approaches or exceeds $T$, the sample covariance matrix becomes:
+\begin{itemize}
+    \item \textbf{Singular}: When $N > T$, the matrix is not invertible
+    \item \textbf{Ill-conditioned}: Extreme eigenvalues distort risk estimates
+    \item \textbf{Noisy}: Estimation error dominates true covariance structure
+\end{itemize}
+
+\subsection{Random Matrix Theory Background}
+
+Random Matrix Theory (RMT) provides tools to distinguish signal from noise in high-dimensional covariance matrices. For a random matrix with i.i.d. entries, the eigenvalue distribution follows the Marchenko-Pastur law.
+
+\begin{definition}[Marchenko-Pastur Distribution]
+For a random $T \times N$ matrix with i.i.d. entries of variance $\sigma^2$, as $T, N \to \infty$ with $q = N/T$ fixed, the eigenvalues of the sample correlation matrix are bounded by:
+\begin{equation}
+\lambda_{\pm} = \sigma^2\left(1 \pm \sqrt{q}\right)^2
+\label{eq:mp_bounds}
+\end{equation}
+\end{definition}
+
+For a correlation matrix where $\sigma^2 = 1$, the maximum eigenvalue of pure noise is:
+\begin{equation}
+\lambda_{\max}^{\text{noise}} = \left(1 + \sqrt{N/T}\right)^2
+\label{eq:lambda_max}
+\end{equation}
+
+\subsection{RMT Denoising Algorithm}
+
+Our implementation applies the following denoising procedure:
+
+\begin{algorithm}[H]
+\caption{RMT Covariance Denoising}
+\begin{algorithmic}[1]
+\Require Returns matrix $\mathbf{X} \in \R^{T \times N}$
+\Ensure Denoised covariance matrix $\hat{\Sigma}_{\text{RMT}}$
+
+\State \textbf{Step 1: Standardization}
+\State Compute volatility: $\sigma_i = \text{std}(X_{\cdot,i})$ for each asset $i$
+\State Standardize: $\tilde{X}_{t,i} = (X_{t,i} - \bar{X}_i) / \sigma_i$
+
+\State \textbf{Step 2: Correlation Matrix}
+\State Compute sample correlation: $\hat{C} = \frac{1}{T-1}\tilde{\mathbf{X}}^\top \tilde{\mathbf{X}}$
+
+\State \textbf{Step 3: Eigendecomposition}
+\State Decompose: $\hat{C} = \mathbf{V} \mathbf{\Lambda} \mathbf{V}^\top$ where $\Lambda = \diag(\lambda_1, \ldots, \lambda_N)$
+\State Sort eigenvalues: $\lambda_1 \geq \lambda_2 \geq \cdots \geq \lambda_N$
+
+\State \textbf{Step 4: Signal-Noise Separation}
+\State Compute threshold: $\lambda_{\max} = (1 + \sqrt{N/T})^2$
+\State Count signal factors: $k = \#\{i : \lambda_i > \lambda_{\max}\}$
+\State Ensure $k \geq 1$ (keep at least the market mode)
+
+\State \textbf{Step 5: Noise Replacement}
+\State Compute noise mean: $\bar{\lambda}_{\text{noise}} = \frac{1}{N-k}\sum_{i=k+1}^{N} \lambda_i$
+\State Replace noise eigenvalues: $\tilde{\lambda}_i = \bar{\lambda}_{\text{noise}}$ for $i > k$
+
+\State \textbf{Step 6: Reconstruction}
+\State Reconstruct correlation: $\tilde{C} = \mathbf{V} \diag(\tilde{\lambda}_1, \ldots, \tilde{\lambda}_N) \mathbf{V}^\top$
+\State Enforce unit diagonal: $\tilde{C}_{ii} = 1$
+
+\State \textbf{Step 7: Restore Covariance}
+\State Compute: $\hat{\Sigma}_{\text{RMT}} = \diag(\boldsymbol{\sigma}) \, \tilde{C} \, \diag(\boldsymbol{\sigma})$
+
+\State \Return $\hat{\Sigma}_{\text{RMT}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties of RMT Denoising}
+
+The RMT denoising procedure has several desirable properties:
+\begin{enumerate}
+    \item \textbf{Trace Preservation}: The trace (sum of variances) is preserved:
+    \begin{equation}
+    \tr(\tilde{C}) = \sum_{i=1}^{k} \tilde{\lambda}_i + (N-k)\bar{\lambda}_{\text{noise}} = N
+    \end{equation}
+    
+    \item \textbf{Improved Conditioning}: By compressing noise eigenvalues, the condition number is reduced.
+    
+    \item \textbf{Signal Retention}: The largest eigenvalues (market factor, sector factors) are preserved.
+    
+    \item \textbf{Automatic Factor Selection}: The Marchenko-Pastur bound provides a data-driven criterion for selecting the number of factors.
+\end{enumerate}
+
+% ============================================================================
+% SECTION 5: DISTANCE COMPUTATION
+% ============================================================================
+\section{Distance Computation and GPU Acceleration}
+
+\subsection{Correlation Distance}
+
+To perform hierarchical clustering, we transform the correlation matrix into a distance metric. We use the standard correlation distance:
+
+\begin{equation}
+d_{ij}^{\text{corr}} = \sqrt{\frac{1 - \rho_{ij}}{2}}
+\label{eq:corr_dist}
+\end{equation}
+
+where $\rho_{ij}$ is the correlation between assets $i$ and $j$.
+
+\begin{remark}
+This transformation maps correlations $\rho \in [-1, 1]$ to distances $d \in [0, 1]$:
+\begin{itemize}
+    \item Perfect positive correlation ($\rho = 1$) $\Rightarrow$ $d = 0$
+    \item Zero correlation ($\rho = 0$) $\Rightarrow$ $d = 1/\sqrt{2} \approx 0.707$
+    \item Perfect negative correlation ($\rho = -1$) $\Rightarrow$ $d = 1$
+\end{itemize}
+\end{remark}
+
+\subsection{Euclidean Distance Matrix}
+
+For hierarchical clustering, we compute pairwise Euclidean distances in the correlation distance space:
+
+\begin{equation}
+D_{ij}^{\text{eucl}} = \sqrt{\sum_{k=1}^{N} \left(d_{ik}^{\text{corr}} - d_{jk}^{\text{corr}}\right)^2}
+\label{eq:eucl_dist}
+\end{equation}
+
+This can be computed efficiently using the identity:
+\begin{equation}
+D_{ij}^2 = \|d_i\|^2 + \|d_j\|^2 - 2 \langle d_i, d_j \rangle
+\label{eq:eucl_efficient}
+\end{equation}
+
+\subsection{GPU Implementation}
+
+Our implementation leverages CUDA/CuPy for GPU acceleration of the distance computations:
+
+\begin{enumerate}
+    \item \textbf{Correlation Distance}: Element-wise operations on correlation matrix
+    \begin{equation}
+    \mathbf{D}^{\text{corr}} = \sqrt{\frac{\mathbf{1} - \boldsymbol{\rho}}{2}} \quad \text{(GPU vectorized)}
+    \end{equation}
+    
+    \item \textbf{Euclidean Distance}: Exploiting GPU's parallel matrix multiplication
+    \begin{equation}
+    \mathbf{D}^{\text{eucl}} = \sqrt{\mathbf{n} \mathbf{1}^\top + \mathbf{1} \mathbf{n}^\top - 2 \mathbf{D}^{\text{corr}} (\mathbf{D}^{\text{corr}})^\top}
+    \end{equation}
+    where $\mathbf{n} = \diag(\mathbf{D}^{\text{corr}} (\mathbf{D}^{\text{corr}})^\top)$ is the vector of squared norms.
+\end{enumerate}
+
+For a universe of $N = 1000$ assets:
+\begin{itemize}
+    \item CPU (NumPy): $\sim$5--10 seconds
+    \item GPU (CuPy/CUDA): $\sim$0.1--0.3 seconds (hardware dependent)
+\end{itemize}
+
+% ============================================================================
+% SECTION 6: HIERARCHICAL CLUSTERING
+% ============================================================================
+\section{Hierarchical Clustering}
+
+\subsection{Ward's Linkage Method}
+
+We employ Ward's minimum variance method for hierarchical agglomerative clustering. At each step, Ward's method merges the pair of clusters that minimizes the total within-cluster variance.
+
+\begin{definition}[Ward's Criterion]
+The distance between clusters $A$ and $B$ is defined as:
+\begin{equation}
+d_W(A, B) = \sqrt{\frac{2 |A| |B|}{|A| + |B|}} \|\bar{x}_A - \bar{x}_B\|
+\label{eq:ward}
+\end{equation}
+where $|A|$, $|B|$ are cluster sizes and $\bar{x}_A$, $\bar{x}_B$ are cluster centroids.
+\end{definition}
+
+Ward's method is preferred over single or complete linkage because:
+\begin{itemize}
+    \item It produces more balanced clusters (avoids ``chaining'')
+    \item It explicitly minimizes variance, aligning with our risk-parity objective
+    \item Empirically, it produces more stable clusterings over time
+\end{itemize}
+
+\subsection{Linkage Matrix}
+
+The output of hierarchical clustering is a linkage matrix $\mathbf{Z} \in \R^{(N-1) \times 4}$ where each row $[z_1, z_2, d, n]$ indicates:
+\begin{itemize}
+    \item $z_1, z_2$: Indices of clusters being merged
+    \item $d$: Distance between merged clusters
+    \item $n$: Number of observations in the new cluster
+\end{itemize}
+
+\subsection{Implementation Note}
+
+SciPy's \texttt{linkage} function requires a condensed distance matrix (upper triangle only), computed via:
+\begin{equation}
+\mathbf{d}_{\text{condensed}} = \text{squareform}(\mathbf{D}^{\text{eucl}})
+\end{equation}
+
+resulting in a vector of length $N(N-1)/2$.
+
+% ============================================================================
+% SECTION 7: QUASI-DIAGONALIZATION
+% ============================================================================
+\section{Quasi-Diagonalization (Seriation)}
+
+\subsection{Motivation}
+
+The hierarchical clustering produces a binary tree (dendrogram) structure, but the ordering of leaves within the tree is not unique. Quasi-diagonalization reorders the assets such that correlated assets are placed adjacent to each other, producing a ``quasi-diagonal'' covariance matrix.
+
+\subsection{Seriation Algorithm}
+
+The seriation algorithm traverses the dendrogram from root to leaves, recursively ordering clusters:
+
+\begin{algorithm}[H]
+\caption{Quasi-Diagonalization (Seriation)}
+\begin{algorithmic}[1]
+\Require Linkage matrix $\mathbf{Z}$, number of assets $N$
+\Ensure Ordered list of asset indices $\pi$
+
+\State Initialize: $\pi = [\mathbf{Z}_{N-2, 0}, \mathbf{Z}_{N-2, 1}]$ (root children)
+
+\While{$\max(\pi) \geq N$}
+    \For{$i$ in $\pi$ where $\pi_i \geq N$}
+        \State $j \gets \pi_i - N$ \Comment{Index into linkage matrix}
+        \State Replace $\pi_i$ with $[\mathbf{Z}_{j, 0}, \mathbf{Z}_{j, 1}]$
+    \EndFor
+\EndWhile
+
+\State \Return $\pi$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Result}
+
+After seriation, if we reorder the covariance matrix as $\tilde{\Sigma} = \Sigma_{\pi, \pi}$, the resulting matrix has the largest values concentrated along the diagonal, with off-diagonal elements decaying as we move away from the diagonal.
+
+% ============================================================================
+% SECTION 8: RECURSIVE BISECTION
+% ============================================================================
+\section{Recursive Bisection for Weight Allocation}
+
+\subsection{Inverse-Variance Weighting Within Clusters}
+
+For a cluster $C$ of assets, we compute the cluster variance using inverse-variance portfolio weights:
+\begin{equation}
+w_i^{\text{IVP}} = \frac{1/\sigma_i^2}{\sum_{j \in C} 1/\sigma_j^2}, \quad i \in C
+\label{eq:ivp}
+\end{equation}
+
+The cluster variance is then:
+\begin{equation}
+\sigma_C^2 = \mathbf{w}^{\text{IVP}\top} \Sigma_C \, \mathbf{w}^{\text{IVP}}
+\label{eq:cluster_var}
+\end{equation}
+
+where $\Sigma_C$ is the submatrix of the covariance matrix for assets in cluster $C$.
+
+\subsection{Recursive Bisection Algorithm}
+
+\begin{algorithm}[H]
+\caption{HRP Recursive Bisection}
+\begin{algorithmic}[1]
+\Require Covariance matrix $\Sigma$, seriated asset order $\pi$
+\Ensure Portfolio weights $\mathbf{w}$
+
+\State Initialize: $w_i = 1$ for all $i \in \pi$
+\State Initialize cluster list: $\mathcal{C} = [\pi]$
+
+\While{$|\mathcal{C}| > 0$}
+    \State Split each cluster at midpoint: $\mathcal{C} \gets \{C_L, C_R : C \in \mathcal{C}, |C| > 1\}$
+    
+    \For{adjacent cluster pairs $(C_L, C_R)$}
+        \State Compute cluster variances: $\sigma_{C_L}^2$, $\sigma_{C_R}^2$
+        \State Compute allocation factor: $\alpha = 1 - \frac{\sigma_{C_L}^2}{\sigma_{C_L}^2 + \sigma_{C_R}^2}$
+        \State Update weights: $w_i \gets w_i \times \alpha$ for $i \in C_L$
+        \State Update weights: $w_i \gets w_i \times (1 - \alpha)$ for $i \in C_R$
+    \EndFor
+\EndWhile
+
+\State Normalize: $\mathbf{w} \gets \mathbf{w} / \sum_i w_i$
+\State \Return $\mathbf{w}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Intuition}
+
+The recursive bisection allocates capital inversely proportional to cluster variance:
+\begin{itemize}
+    \item \textbf{Low variance cluster}: Receives more weight (safer allocation)
+    \item \textbf{High variance cluster}: Receives less weight (risk reduction)
+\end{itemize}
+
+The hierarchical structure ensures that:
+\begin{enumerate}
+    \item Correlated assets (within the same branch) share a common allocation
+    \item Diversification is achieved across uncorrelated branches
+    \item The algorithm naturally adapts to the correlation structure
+\end{enumerate}
+
+% ============================================================================
+% SECTION 9: PORTFOLIO REBALANCING
+% ============================================================================
+\section{Portfolio Rebalancing}
+
+\subsection{Rebalancing Frequency}
+
+We employ monthly rebalancing at end-of-month dates. This frequency balances:
+\begin{itemize}
+    \item \textbf{Responsiveness}: Capturing changes in the correlation structure
+    \item \textbf{Transaction Costs}: Limiting turnover-induced costs
+    \item \textbf{Data Availability}: Aligning with CRSP monthly data
+\end{itemize}
+
+\subsection{Lookback Window}
+
+We use a 60-month (5-year) rolling window for covariance estimation:
+\begin{equation}
+\Sigma_t = \text{RMT-Denoise}\left(\mathbf{R}_{t-59:t}\right)
+\label{eq:lookback}
+\end{equation}
+
+This window length provides:
+\begin{itemize}
+    \item Sufficient observations for stable covariance estimates ($T = 60$)
+    \item Reasonable adaptation to structural changes in correlations
+    \item Coverage of different market regimes (expansion/recession)
+\end{itemize}
+
+\subsection{Universe Refresh}
+
+At each rebalancing date $t$:
+\begin{enumerate}
+    \item Apply universe filters to determine eligible stocks
+    \item Require complete return history for the 60-month window
+    \item Require minimum of 20 stocks in the universe
+\end{enumerate}
+
+\begin{remark}[Strict Compliance with No Look-Ahead Bias]
+We explicitly \textbf{do not} require tradability in the subsequent month. This ensures that no future information is used in the portfolio construction process. Stocks are selected based solely on information available at time $t$.
+\end{remark}
+
+\subsection{Return Calculation and Missing Data Treatment}
+
+Monthly portfolio return is computed as:
+\begin{equation}
+R_{p,t+1} = \sum_{i=1}^{N_t} w_{i,t} \times \tilde{R}_{i,t+1}
+\label{eq:port_return}
+\end{equation}
+
+where $w_{i,t}$ are the HRP weights computed at time $t$ and $\tilde{R}_{i,t+1}$ is the \textit{adjusted} realized return over month $t+1$, defined as:
+
+\begin{equation}
+\tilde{R}_{i,t+1} = \begin{cases}
+R_{i,t+1} & \text{if } R_{i,t+1} \text{ is observed} \\
+-1 & \text{if } R_{i,t+1} \text{ is missing (total loss)}
+\end{cases}
+\label{eq:missing_return}
+\end{equation}
+
+\begin{remark}[Conservative Missing Data Treatment]
+When a stock's return is missing in month $t+1$ (due to delisting, trading halt, or data issues), we assume a \textbf{total loss} ($R = -100\%$). This is the most conservative assumption and ensures:
+\begin{itemize}
+    \item No look-ahead bias (we do not exclude stocks that we ``know'' will delist)
+    \item Conservative performance estimates (actual losses are typically less severe)
+    \item Proper accounting for delisting risk in illiquid or distressed stocks
+\end{itemize}
+Note that CRSP delisting returns (DLRET) are already incorporated where available; the $-100\%$ assumption applies only to truly missing data.
+\end{remark}
+
+% ============================================================================
+% SECTION 10: PERFORMANCE EVALUATION
+% ============================================================================
+\section{Performance Evaluation}
+
+\subsection{Return Metrics}
+
+\textbf{Annualized Return:}
+\begin{equation}
+R_{\text{ann}} = \left(\prod_{t=1}^{T} (1 + R_{p,t})\right)^{12/T} - 1
+\label{eq:ann_return}
+\end{equation}
+
+\textbf{Cumulative Return:}
+\begin{equation}
+R_{\text{cum}} = \prod_{t=1}^{T} (1 + R_{p,t}) - 1
+\label{eq:cum_return}
+\end{equation}
+
+\subsection{Risk-Adjusted Metrics}
+
+\textbf{Sharpe Ratio:}
+\begin{equation}
+SR = \frac{\bar{R}_p - \bar{R}_f}{\sigma_p} \times \sqrt{12}
+\label{eq:sharpe}
+\end{equation}
+
+where $\bar{R}_p$ is mean monthly return, $\bar{R}_f$ is mean monthly risk-free rate, and $\sigma_p$ is monthly return standard deviation.
+
+\textbf{Maximum Drawdown:}
+\begin{equation}
+\text{MDD} = \max_{t} \left(\frac{\max_{s \leq t} V_s - V_t}{\max_{s \leq t} V_s}\right)
+\label{eq:mdd}
+\end{equation}
+
+where $V_t$ is the portfolio value at time $t$.
+
+\textbf{Calmar Ratio:}
+\begin{equation}
+\text{Calmar} = \frac{R_{\text{ann}}}{\text{MDD}}
+\label{eq:calmar}
+\end{equation}
+
+\subsection{Win Rate and Hit Ratio}
+
+\begin{equation}
+\text{Win Rate} = \frac{\#\{t : R_{p,t} > 0\}}{T}
+\label{eq:winrate}
+\end{equation}
+
+\subsection{Identity Risk Detection}
+
+A diagnostic check for covariance matrix quality is the ``identity risk'' test. When shrinkage is excessive, the covariance matrix approaches the identity matrix, leading to equal weights:
+
+\begin{equation}
+\text{MAD}_{\text{EW}} = \frac{1}{N}\sum_{i=1}^{N} \left|w_i - \frac{1}{N}\right|
+\label{eq:mad_ew}
+\end{equation}
+
+If $\text{MAD}_{\text{EW}} < \epsilon$ for some small threshold $\epsilon$, the portfolio has degenerated to equal weight, indicating potential shrinkage saturation.
+
+% ============================================================================
+% SECTION 11: IMPLEMENTATION DETAILS
+% ============================================================================
+\section{Implementation Details}
+
+\subsection{Software Stack}
+
+\begin{itemize}
+    \item \textbf{Python 3.10+}: Core language
+    \item \textbf{NumPy}: CPU numerical computations
+    \item \textbf{CuPy (CUDA 12.x)}: GPU-accelerated array operations
+    \item \textbf{SciPy}: Hierarchical clustering (\texttt{scipy.cluster.hierarchy})
+    \item \textbf{Pandas}: Data manipulation and time series handling
+    \item \textbf{Joblib}: Checkpoint persistence
+\end{itemize}
+
+\subsection{Numerical Stability}
+
+Several safeguards ensure numerical stability:
+\begin{enumerate}
+    \item \textbf{Variance Floor}: $\sigma_i^2 \geq 10^{-10}$ to prevent division by zero
+    \item \textbf{Correlation Clipping}: $\rho_{ij} \in [-1, 1]$ enforced after computation
+    \item \textbf{Distance NaN Handling}: Replace NaN/Inf with small positive values
+    \item \textbf{Weight Normalization}: Final weights are renormalized to sum to 1
+\end{enumerate}
+
+\subsection{Checkpointing}
+
+For long backtests, we implement periodic checkpointing:
+\begin{itemize}
+    \item Checkpoint saved every 20 rebalancing periods
+    \item Contains: strategy returns, weights dictionary, last completed index
+    \item Enables resumption after interruption
+\end{itemize}
+
+% ============================================================================
+% SECTION 12: CONCLUSION
+% ============================================================================
+\section{Conclusion}
+
+This document has detailed the complete HRP portfolio optimization methodology, from raw data ingestion through weight allocation. Key innovations in our implementation include:
+
+\begin{enumerate}
+    \item \textbf{RMT Denoising}: Random Matrix Theory-based covariance shrinkage for robust estimation
+    \item \textbf{Industry-Relative Liquidity}: Fama-French 12 industry classification for balanced universe construction
+    \item \textbf{GPU Acceleration}: CUDA/CuPy implementation for efficient distance computations
+    \item \textbf{Delisting Adjustment}: Proper handling of delisting returns to avoid survivorship bias
+\end{enumerate}
+
+The resulting portfolio weights respect the hierarchical structure of asset correlations, providing diversification without requiring expected return estimates.
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\bibliographystyle{apalike}
+\begin{thebibliography}{99}
+
+\bibitem[López de Prado(2016)]{lopez2016building}
+López de Prado, M. (2016).
+\newblock Building diversified portfolios that outperform out-of-sample.
+\newblock \emph{The Journal of Portfolio Management}, 42(4):59--69.
+
+\bibitem[Markowitz(1952)]{markowitz1952}
+Markowitz, H. (1952).
+\newblock Portfolio selection.
+\newblock \emph{The Journal of Finance}, 7(1):77--91.
+
+\bibitem[Shumway(1997)]{shumway1997delisting}
+Shumway, T. (1997).
+\newblock The delisting bias in CRSP data.
+\newblock \emph{The Journal of Finance}, 52(1):327--340.
+
+\bibitem[Ledoit \& Wolf(2004)]{ledoit2004well}
+Ledoit, O., \& Wolf, M. (2004).
+\newblock A well-conditioned estimator for large-dimensional covariance matrices.
+\newblock \emph{Journal of Multivariate Analysis}, 88(2):365--411.
+
+\bibitem[Bun et al.(2017)]{bun2017cleaning}
+Bun, J., Bouchaud, J.-P., \& Potters, M. (2017).
+\newblock Cleaning large correlation matrices: Tools from Random Matrix Theory.
+\newblock \emph{Physics Reports}, 666:1--109.
+
+\bibitem[Ward(1963)]{ward1963hierarchical}
+Ward Jr, J. H. (1963).
+\newblock Hierarchical grouping to optimize an objective function.
+\newblock \emph{Journal of the American Statistical Association}, 58(301):236--244.
+
+\end{thebibliography}
+
+\end{document}

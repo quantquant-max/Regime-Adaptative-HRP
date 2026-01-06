@@ -1,0 +1,38 @@
+{
+  "hmm": {
+    "n_components": 2,
+    "min_train": 60,
+    "refit_freq": 12
+  },
+  "features": [
+    "dispersion_z",
+    "amihud_z",
+    "bab_z",
+    "avg_pairwise_corr_z",
+    "credit_spread",
+    "term_spread",
+    "cpi_vol",
+    "m2_growth",
+    "unrate_trend",
+    "valuation_spread_z",
+    "rsi",
+    "hrp_mom_1m_z",
+    "hrp_mom_3m_z",
+    "hrp_mom_12m_z"
+  ],
+  "tx_cost_bps": 10,
+  "prediction_metrics": {
+    "accuracy": 0.6622807017543859,
+    "roc_auc": 0.7645109953703704,
+    "precision_bear": 0.35353535353535354,
+    "precision_bull": 0.8992248062015504,
+    "recall_bear": 0.7291666666666666,
+    "recall_bull": 0.6444444444444445,
+    "f1_bear": 0.47619047619047616,
+    "f1_bull": 0.7508090614886731
+  },
+  "date_range": {
+    "start": "1986-11-30",
+    "end": "2024-10-31"
+  }
+}

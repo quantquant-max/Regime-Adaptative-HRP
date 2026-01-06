@@ -1,0 +1,45 @@
+project:
+  name: "CUDA-HRP-Super-Agent"
+  output_dir: "Super_Agent_Output"
+  random_seed: 42          # Centralized random seed for reproducibility
+
+data:
+  start_date: "1960-01-01"
+  market_index: "VWRETD"
+  rebalance_freq: "1M"
+  min_stocks: 20
+  window: 60
+
+paths:
+  data_dir: "DATA"
+  fred_dir: "DATA/FRED"
+
+# HMM Regime Detection
+hmm:
+  min_train: 60          # Minimum months before first HMM fit
+  refit_freq: 12         # Refit every N months
+  n_components: 2        # Number of regimes (Bear/Bull)
+  downside_window: 6     # Window for downside deviation
+
+# XGBoost ML Configuration - Bear/Bull Regime Prediction
+ml:
+  min_train_months: 120  # Minimum training data before predictions
+  refit_frequency: 12    # Refit model every N months
+  optuna_trials: 50      # Number of Optuna hyperparameter trials (initial, if not tuning in WF)
+  optuna_trials_per_refit: 20  # Optuna trials per refit inside walk-forward
+  optuna_cv_splits: 5    # CV splits for Optuna
+  purge_gap: 12          # Months to purge between train/test (match vol lookback)
+  embargo_pct: 0.01      # Embargo period as % of test size
+  importance_threshold: 0.0  # Feature selection threshold
+  select_features_in_wf: true  # Feature selection inside walk-forward
+  tune_hyperparams_in_wf: true  # Hyperparameter tuning inside walk-forward
+
+# Strategy Parameters
+strategy:
+  tx_cost_bps: 10        # Transaction cost in basis points (inner + outer)
+  bear_allocation: 0.5   # Allocation during bear regime (binary switch)
+  financing_spread_bps: 50  # Borrowing spread over risk-free rate (IBKR Pro: 50bps for $50M-$250M AUM)
+
+# Computation Options
+computation:
+  recompute_weights: False  # If false, load HRP weights from existing CSVs
