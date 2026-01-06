@@ -297,8 +297,9 @@ def compute_hrp_weights(returns_df, variance_window=None, debug=False, use_gpu=T
     eucl_dist_condensed = np.nan_to_num(eucl_dist_condensed, nan=1e-8, posinf=1e-8, neginf=1e-8)
 
     # Step 5: Hierarchical clustering (CPU only - scipy)
+    # Using 'single' linkage (nearest neighbor) - better suited for industry ETF framework
     try:
-        link = perform_clustering(eucl_dist_condensed, method='ward')
+        link = perform_clustering(eucl_dist_condensed, method='single')
     except Exception as e:
         raise RuntimeError(f"Clustering failed: {e}")
 

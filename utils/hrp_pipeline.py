@@ -64,6 +64,10 @@ def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, outp
         # Save industry counts for analysis
         industry_counts.to_csv(os.path.join(output_dir, 'industry_stock_counts.csv'))
         
+        # Save industry ETF returns for reuse (e.g., dendrogram visualization)
+        industry_returns.to_csv(os.path.join(output_dir, 'industry_etf_returns.csv'))
+        logger.info(f"✓ Saved industry ETF returns: {os.path.join(output_dir, 'industry_etf_returns.csv')}")
+        
         # Run HRP on industry ETFs
         strategy_returns, all_weights_dict, stock_weights_dict = _run_industry_hrp(
             industry_returns, industry_weights_dict, returns_all, 

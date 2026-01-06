@@ -15,6 +15,7 @@ data:
 # Two-Stage HRP Configuration
 hrp:
   use_industry_etfs: true  # Enable two-stage HRP (recommended: N=12 < T=60)
+  linkage_method: single   # 'single' (nearest neighbor) or 'ward' (min variance)
   # Stage 1: Value-weighted FF12 industry ETFs
   # Stage 2: HRP allocation across 12 industries
 
