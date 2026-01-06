@@ -7,8 +7,16 @@ data:
   start_date: "1960-01-01"
   market_index: "VWRETD"
   rebalance_freq: "1M"
-  min_stocks: 20
+  min_stocks: 20           # Legacy: min stocks per date (unused in industry ETF mode)
+  min_industries: 6        # Minimum industries required for HRP (industry ETF mode)
+  min_stocks_per_industry: 3  # Minimum stocks per industry to include
   window: 60
+
+# Two-Stage HRP Configuration
+hrp:
+  use_industry_etfs: true  # Enable two-stage HRP (recommended: N=12 < T=60)
+  # Stage 1: Value-weighted FF12 industry ETFs
+  # Stage 2: HRP allocation across 12 industries
 
 paths:
   data_dir: "DATA"
@@ -42,4 +50,4 @@ strategy:
 
 # Computation Options
 computation:
-  recompute_weights: False  # If false, load HRP weights from existing CSVs
+  recompute_weights: true  # Set to true to recompute with new two-stage HRP

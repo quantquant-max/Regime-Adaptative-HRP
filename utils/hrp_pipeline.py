@@ -8,30 +8,267 @@ import matplotlib.pyplot as plt
 # Import internal modules
 import hrp_functions
 import hrp_analytics
+import hrp_data
 from hrp_logger import setup_logger
 
 logger = setup_logger()
 
 
-def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, output_dir, universe_flags=None):
+def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, output_dir, 
+                        universe_flags=None, df_universe=None, use_industry_etfs=True,
+                        min_stocks_per_industry=3):
     """
-    Compute HRP weights and monthly returns for a single window (60 months).
+    Compute HRP weights and monthly returns using two-stage approach:
+    
+    Stage 1: Aggregate stocks into 12 Fama-French industry ETFs (value-weighted)
+    Stage 2: Apply HRP to the 12 industry ETFs (N=12 < T=60, statistically valid)
+    
+    Final stock weights = industry_weight × within_industry_weight
     
     Args:
         returns_all: DataFrame of all returns (dates x assets)
         valid_rebal_dates: List of valid rebalancing dates
         window: Lookback window in months (e.g., 60)
-        min_stocks: Minimum number of stocks required
+        min_stocks: Minimum number of stocks required (for industry ETF mode: min industries)
         output_dir: Output directory path
         universe_flags: DataFrame indicating which stocks are in universe at each date
+        df_universe: Full CRSP DataFrame with FF_12, MKT_CAP columns (required for industry ETFs)
+        use_industry_etfs: If True, use two-stage industry ETF approach (recommended)
+        min_stocks_per_industry: Minimum stocks per industry to include
         
     Returns:
         strategy_returns: Series of monthly HRP returns
     """
     logger.info(f"\n{'='*70}")
-    logger.info(f"HRP COMPUTATION (Window: {window} months)")
+    if use_industry_etfs:
+        logger.info(f"TWO-STAGE HRP COMPUTATION (Industry ETF Mode)")
+        logger.info(f"  Stage 1: Value-weighted FF12 Industry ETFs")
+        logger.info(f"  Stage 2: HRP allocation across 12 industries (N=12 < T={window})")
+    else:
+        logger.info(f"HRP COMPUTATION (Direct Stock Mode - WARNING: N>>T)")
     logger.info(f"{'='*70}")
     
+    # ==========================================================================
+    # INDUSTRY ETF MODE (Two-Stage HRP)
+    # ==========================================================================
+    if use_industry_etfs:
+        if df_universe is None:
+            raise ValueError("df_universe required for industry ETF mode. Pass the full CRSP DataFrame.")
+        
+        # Compute industry ETF returns
+        industry_returns, industry_weights_dict, industry_counts = hrp_data.compute_industry_etf_returns(
+            df_universe, returns_all, universe_flags, 
+            min_stocks_per_industry=min_stocks_per_industry
+        )
+        
+        # Save industry counts for analysis
+        industry_counts.to_csv(os.path.join(output_dir, 'industry_stock_counts.csv'))
+        
+        # Run HRP on industry ETFs
+        strategy_returns, all_weights_dict, stock_weights_dict = _run_industry_hrp(
+            industry_returns, industry_weights_dict, returns_all, 
+            valid_rebal_dates, window, min_stocks, output_dir
+        )
+        
+        return strategy_returns
+    
+    # ==========================================================================
+    # LEGACY MODE (Direct Stock HRP - N>>T, statistically questionable)
+    # ==========================================================================
+    else:
+        logger.warning("Using legacy direct stock mode. N>>T may cause covariance instability.")
+        return _run_direct_stock_hrp(
+            returns_all, valid_rebal_dates, window, min_stocks, output_dir, universe_flags
+        )
+
+
+def _run_industry_hrp(industry_returns, industry_weights_dict, returns_all,
+                      valid_rebal_dates, window, min_industries, output_dir):
+    """
+    Run HRP on industry ETF returns (Stage 2 of two-stage HRP).
+    
+    Args:
+        industry_returns: DataFrame of industry ETF returns (dates x 12 industries)
+        industry_weights_dict: {date: {industry: {permno: weight}}} within-industry weights
+        returns_all: Original stock returns for computing actual portfolio returns
+        valid_rebal_dates: List of valid rebalancing dates
+        window: Lookback window in months
+        min_industries: Minimum number of industries required
+        output_dir: Output directory path
+        
+    Returns:
+        strategy_returns: Series of monthly HRP returns
+        all_weights_dict: {date: Series of industry weights}
+        stock_weights_dict: {date: Series of stock weights}
+    """
+    logger.info(f"\nRunning HRP on {industry_returns.shape[1]} Industry ETFs...")
+    logger.info(f"Lookback window: {window} months")
+    logger.info(f"Covariance matrix: {industry_returns.shape[1]}×{industry_returns.shape[1]} (FULL RANK)")
+    
+    strategy_returns = pd.Series(index=valid_rebal_dates, dtype=float, name=f'HRP_{window}m')
+    all_weights_dict = {}      # Industry-level HRP weights
+    stock_weights_dict = {}    # Final stock-level weights
+    
+    checkpoint_file = os.path.join(output_dir, 'hrp_checkpoint.pkl')
+    start_idx = 0
+    
+    if os.path.exists(checkpoint_file):
+        logger.info(f"Found checkpoint file. Loading previous progress...")
+        checkpoint = joblib.load(checkpoint_file)
+        strategy_returns = checkpoint['strategy_returns']
+        all_weights_dict = checkpoint.get('all_weights_dict', {})
+        stock_weights_dict = checkpoint.get('stock_weights_dict', {})
+        start_idx = checkpoint['last_completed_idx'] + 1
+        logger.info(f"Resuming from rebalance {start_idx}/{len(valid_rebal_dates)}")
+    else:
+        logger.info("Starting HRP computation from scratch...")
+
+    logger.info(f"Total rebalance dates: {len(valid_rebal_dates)}")
+
+    for idx, rebal_date in enumerate(tqdm(valid_rebal_dates[start_idx:], desc="Computing Industry HRP", 
+                                          initial=start_idx, total=len(valid_rebal_dates))):
+        
+        # Get window of industry returns
+        window_start = rebal_date - pd.DateOffset(months=window)
+        
+        # Filter industry returns to window
+        mask = (industry_returns.index >= window_start) & (industry_returns.index <= rebal_date)
+        window_ind_returns = industry_returns.loc[mask].copy()
+        
+        # Drop industries with any NaN in window (need complete history)
+        window_ind_returns = window_ind_returns.dropna(axis=1, how='any')
+        
+        if window_ind_returns.shape[1] < min_industries:
+            logger.warning(f"  {rebal_date.date()}: Only {window_ind_returns.shape[1]} industries with full data, skipping")
+            continue
+        
+        if window_ind_returns.shape[0] < window * 0.8:  # Require at least 80% of window
+            logger.warning(f"  {rebal_date.date()}: Only {window_ind_returns.shape[0]} months of data, skipping")
+            continue
+        
+        try:
+            # =================================================================
+            # STAGE 2: HRP on Industry ETFs
+            # =================================================================
+            industry_weights = hrp_functions.compute_hrp_weights(window_ind_returns)
+            
+            # Check for identity risk
+            risk = hrp_analytics.check_identity_risk(industry_weights)
+            if risk['is_identity']:
+                logger.warning(f"  [!] {rebal_date.date()}: Industry weights near equal weight (MAD={risk['mad_ew']:.6f})")
+            
+            all_weights_dict[rebal_date] = industry_weights
+            
+            # =================================================================
+            # DECOMPOSE TO STOCK WEIGHTS
+            # =================================================================
+            # Get within-industry weights for this date
+            if rebal_date not in industry_weights_dict:
+                logger.warning(f"  {rebal_date.date()}: No within-industry weights, skipping")
+                continue
+            
+            within_ind_weights = industry_weights_dict[rebal_date]
+            
+            # Final stock weight = industry_weight × within_industry_weight
+            final_stock_weights = {}
+            for industry_name, ind_weight in industry_weights.items():
+                # Map industry name back to ID
+                ind_id = [k for k, v in hrp_data.FF12_INDUSTRY_NAMES.items() if v == industry_name]
+                if not ind_id:
+                    continue
+                ind_id = ind_id[0]
+                
+                if ind_id in within_ind_weights:
+                    for permno, within_weight in within_ind_weights[ind_id].items():
+                        final_stock_weights[permno] = ind_weight * within_weight
+            
+            if len(final_stock_weights) == 0:
+                logger.warning(f"  {rebal_date.date()}: No stock weights computed, skipping")
+                continue
+            
+            stock_weights = pd.Series(final_stock_weights)
+            stock_weights = stock_weights / stock_weights.sum()  # Normalize to sum to 1
+            stock_weights_dict[rebal_date] = stock_weights
+            
+            # =================================================================
+            # COMPUTE NEXT MONTH RETURN
+            # =================================================================
+            next_start = rebal_date + pd.DateOffset(days=1)
+            next_end = (rebal_date + pd.DateOffset(months=1)) + pd.tseries.offsets.MonthEnd(0)
+            next_returns = returns_all.loc[next_start:next_end]
+            
+            if next_returns.empty:
+                continue
+            
+            # Align weights with available returns
+            valid_permnos = [p for p in stock_weights.index if p in next_returns.columns]
+            if len(valid_permnos) == 0:
+                continue
+            
+            aligned_weights = stock_weights[valid_permnos]
+            aligned_weights = aligned_weights / aligned_weights.sum()  # Renormalize
+            
+            # Get returns and handle missing (treat as -100% loss)
+            next_month_ret = next_returns[valid_permnos].copy()
+            n_missing = next_month_ret.isna().sum().sum()
+            if n_missing > 0:
+                logger.warning(f"  {rebal_date.date()}: {n_missing} missing returns treated as -100% loss")
+            next_month_ret = next_month_ret.fillna(-1.0)
+            
+            # Compute portfolio return
+            port_ret_series = next_month_ret.dot(aligned_weights)
+            
+            if len(port_ret_series) > 0:
+                month_ret = (1 + port_ret_series).prod() - 1
+                strategy_returns.loc[rebal_date] = month_ret
+                
+        except Exception as e:
+            logger.error(f"Error at {rebal_date}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+        # Save checkpoint periodically
+        if (start_idx + idx) % 20 == 0:
+            joblib.dump({
+                'strategy_returns': strategy_returns,
+                'all_weights_dict': all_weights_dict,
+                'stock_weights_dict': stock_weights_dict,
+                'last_completed_idx': start_idx + idx
+            }, checkpoint_file)
+
+    # ==========================================================================
+    # SAVE OUTPUTS
+    # ==========================================================================
+    strategy_returns.to_csv(os.path.join(output_dir, 'hrp_strategy_returns.csv'))
+    joblib.dump(all_weights_dict, os.path.join(output_dir, 'hrp_industry_weights_dict.pkl'))
+    joblib.dump(stock_weights_dict, os.path.join(output_dir, 'hrp_weights_dict.pkl'))
+    
+    # Save industry weights to CSV
+    industry_weights_df = pd.DataFrame(all_weights_dict).T.sort_index()
+    industry_weights_df.to_csv(os.path.join(output_dir, 'hrp_industry_weights.csv'))
+    
+    # Save stock weights to CSV
+    stock_weights_df = pd.DataFrame(stock_weights_dict).T.sort_index()
+    stock_weights_df.to_csv(os.path.join(output_dir, 'all_hrp_weights.csv'))
+
+    # Clean up checkpoint
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+
+    logger.info(f"\n✓ Two-Stage HRP Computation Completed.")
+    logger.info(f"  - Strategy returns: {os.path.join(output_dir, 'hrp_strategy_returns.csv')}")
+    logger.info(f"  - Industry weights: {os.path.join(output_dir, 'hrp_industry_weights.csv')}")
+    logger.info(f"  - Stock weights: {os.path.join(output_dir, 'all_hrp_weights.csv')}")
+    
+    return strategy_returns, all_weights_dict, stock_weights_dict
+
+
+def _run_direct_stock_hrp(returns_all, valid_rebal_dates, window, min_stocks, output_dir, universe_flags):
+    """
+    Legacy direct stock HRP (N>>T, statistically questionable).
+    Kept for backward compatibility and comparison.
+    """
     strategy_returns = pd.Series(index=valid_rebal_dates, dtype=float, name=f'HRP_{window}m')
     all_weights_dict = {}
     

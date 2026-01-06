@@ -248,7 +248,164 @@ def load_market_data(data_path, benchmark_path, start_date_str='1960-01-01', mar
     valid_rebal_dates = [d for d in rebalance_dates if (d - dates_filtered.min()).days / 30 >= max_win]
     print(f"Valid rebal dates for all windows: {len(valid_rebal_dates)}")
     
-    return returns_all, dates_filtered, valid_rebal_dates, df_ml_universe, universe_flags
+    # Return df_universe for industry ETF computation (contains FF_12, MKT_CAP, etc.)
+    # Filter df_universe to same date range
+    df_universe = df_universe[df_universe['DATE'].isin(dates_filtered)]
+    
+    return returns_all, dates_filtered, valid_rebal_dates, df_ml_universe, universe_flags, df_universe
+
+
+# =============================================================================
+# FAMA-FRENCH 12 INDUSTRY ETF CONSTRUCTION
+# =============================================================================
+
+# Fama-French 12 Industry Names (for reference and plotting)
+FF12_INDUSTRY_NAMES = {
+    1: 'NoDur',   # Consumer Non-Durables
+    2: 'Durbl',   # Consumer Durables
+    3: 'Manuf',   # Manufacturing
+    4: 'Enrgy',   # Energy (Oil, Gas, Coal)
+    5: 'Chems',   # Chemicals
+    6: 'BusEq',   # Business Equipment (Computers, Software)
+    7: 'Telcm',   # Telecommunications
+    8: 'Utils',   # Utilities
+    9: 'Shops',   # Wholesale/Retail
+    10: 'Hlth',   # Healthcare
+    11: 'Money',  # Finance
+    12: 'Other'   # Other
+}
+
+
+def compute_industry_etf_returns(df_universe, returns_all, universe_flags, min_stocks_per_industry=3):
+    """
+    Compute value-weighted industry ETF returns for Fama-French 12 industries.
+    
+    This creates 12 synthetic ETFs from the HRP-filtered universe, enabling
+    statistically valid HRP allocation (N=12 < T=60).
+    
+    Parameters
+    ----------
+    df_universe : pd.DataFrame
+        Full CRSP dataset with columns: DATE, PERMNO, RET, MKT_CAP, FF_12, in_universe_hrp
+    returns_all : pd.DataFrame
+        Pivoted returns matrix (dates x PERMNOs)
+    universe_flags : pd.DataFrame
+        Binary flags (dates x PERMNOs) indicating HRP universe membership
+    min_stocks_per_industry : int
+        Minimum stocks required per industry (industries with fewer are excluded)
+    
+    Returns
+    -------
+    industry_returns : pd.DataFrame
+        Value-weighted industry returns (dates x 12 industries)
+    industry_weights : dict
+        {date: {industry: {permno: weight}}} for decomposing HRP weights to stock level
+    industry_counts : pd.DataFrame
+        Number of stocks per industry per date (for diagnostics)
+    """
+    print(f"\n{'='*70}")
+    print("COMPUTING VALUE-WEIGHTED INDUSTRY ETF RETURNS")
+    print(f"{'='*70}")
+    
+    # Ensure FF_12 column exists
+    if 'FF_12' not in df_universe.columns:
+        raise ValueError("FF_12 column not found in df_universe. Run load_market_data with SIC mapping first.")
+    
+    # Filter to HRP universe only
+    df_hrp = df_universe[df_universe['in_universe_hrp'] == 1].copy()
+    print(f"HRP Universe: {len(df_hrp)} stock-month observations")
+    print(f"Unique stocks: {df_hrp['PERMNO'].nunique()}")
+    
+    # Get unique dates from returns_all
+    dates = returns_all.index
+    
+    # Initialize output containers
+    industry_returns = pd.DataFrame(index=dates, columns=list(FF12_INDUSTRY_NAMES.keys()), dtype=float)
+    industry_weights = {}  # {date: {industry: {permno: weight_within_industry}}}
+    industry_counts = pd.DataFrame(index=dates, columns=list(FF12_INDUSTRY_NAMES.keys()), dtype=float)
+    
+    # Convert PERMNO to string for matching with returns_all columns
+    df_hrp['PERMNO_STR'] = df_hrp['PERMNO'].astype(str)
+    
+    for date in dates:
+        # Get stocks in universe on this date
+        date_data = df_hrp[df_hrp['DATE'] == date].copy()
+        
+        if len(date_data) == 0:
+            continue
+        
+        industry_weights[date] = {}
+        
+        for ind_id in FF12_INDUSTRY_NAMES.keys():
+            # Get stocks in this industry
+            ind_stocks = date_data[date_data['FF_12'] == ind_id]
+            
+            # Record count
+            industry_counts.loc[date, ind_id] = len(ind_stocks)
+            
+            if len(ind_stocks) < min_stocks_per_industry:
+                # Not enough stocks - leave as NaN
+                industry_weights[date][ind_id] = {}
+                continue
+            
+            # Calculate value weights within industry (market cap weighted)
+            mkt_caps = ind_stocks.set_index('PERMNO_STR')['MKT_CAP']
+            total_cap = mkt_caps.sum()
+            
+            if total_cap <= 0:
+                industry_weights[date][ind_id] = {}
+                continue
+            
+            # Value weights (sum to 1 within industry)
+            vw_weights = mkt_caps / total_cap
+            industry_weights[date][ind_id] = vw_weights.to_dict()
+            
+            # Get returns for these stocks
+            permnos = ind_stocks['PERMNO_STR'].tolist()
+            valid_permnos = [p for p in permnos if p in returns_all.columns]
+            
+            if len(valid_permnos) == 0:
+                continue
+            
+            # Get return for this date
+            stock_returns = returns_all.loc[date, valid_permnos]
+            
+            # Align weights with available returns
+            aligned_weights = vw_weights.reindex(valid_permnos).fillna(0)
+            aligned_weights = aligned_weights / aligned_weights.sum()  # Renormalize
+            
+            # Compute value-weighted return (handle NaN returns as 0)
+            stock_returns_clean = stock_returns.fillna(0)
+            industry_ret = (stock_returns_clean * aligned_weights).sum()
+            
+            industry_returns.loc[date, ind_id] = industry_ret
+    
+    # Rename columns to industry names
+    industry_returns.columns = [FF12_INDUSTRY_NAMES[c] for c in industry_returns.columns]
+    industry_counts.columns = [FF12_INDUSTRY_NAMES[c] for c in industry_counts.columns]
+    
+    # Drop rows with all NaN (before data starts)
+    industry_returns = industry_returns.dropna(how='all')
+    
+    # Summary statistics
+    print(f"\nIndustry ETF Returns: {industry_returns.shape[0]} dates × {industry_returns.shape[1]} industries")
+    print(f"Date range: {industry_returns.index.min().date()} to {industry_returns.index.max().date()}")
+    
+    # Count valid industries per date
+    valid_ind_counts = industry_returns.notna().sum(axis=1)
+    print(f"\nValid industries per date:")
+    print(f"  Mean: {valid_ind_counts.mean():.1f}")
+    print(f"  Min:  {valid_ind_counts.min():.0f}")
+    print(f"  Max:  {valid_ind_counts.max():.0f}")
+    
+    # Average stocks per industry
+    print(f"\nAverage stocks per industry:")
+    for ind_name in industry_counts.columns:
+        avg = industry_counts[ind_name].mean()
+        print(f"  {ind_name}: {avg:.1f}")
+    
+    return industry_returns, industry_weights, industry_counts
+
 
 def load_fred_data(fred_path, start_date_str='1960-01-01'):
     """

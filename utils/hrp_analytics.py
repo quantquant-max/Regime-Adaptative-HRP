@@ -828,5 +828,136 @@ def plot_rmt_comparison(returns_all, universe_flags, target_date, window, save_p
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
     
+    return corr_raw, corr_denoised
+
+
+def plot_industry_hrp_weights(industry_weights_path, output_dir):
+    """
+    Plot HRP industry weights over time (stacked area chart + heatmap).
+    
+    Args:
+        industry_weights_path: Path to hrp_industry_weights.csv
+        output_dir: Directory to save plots
+    """
+    # Load industry weights
+    df = pd.read_csv(industry_weights_path, index_col=0, parse_dates=True)
+    
+    # Define colors for industries
+    colors = plt.cm.tab20(np.linspace(0, 1, len(df.columns)))
+    
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    
+    # =========================================================================
+    # Plot 1: Stacked Area Chart
+    # =========================================================================
+    ax1 = axes[0]
+    ax1.stackplot(df.index, df.T.values, labels=df.columns, colors=colors, alpha=0.8)
+    ax1.set_ylabel('Weight')
+    ax1.set_xlabel('Date')
+    ax1.set_title('HRP Industry Weights Over Time (Stacked Area)', fontsize=12, fontweight='bold')
+    ax1.set_ylim(0, 1)
+    ax1.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    
+    # =========================================================================
+    # Plot 2: Heatmap
+    # =========================================================================
+    ax2 = axes[1]
+    
+    # Resample to quarterly for readability if too many dates
+    if len(df) > 100:
+        df_plot = df.resample('QE').mean()
+        title_suffix = "(Quarterly Average)"
+    else:
+        df_plot = df
+        title_suffix = "(Monthly)"
+    
+    im = ax2.imshow(df_plot.T.values, aspect='auto', cmap='YlOrRd', vmin=0, vmax=df_plot.max().max())
+    ax2.set_yticks(range(len(df_plot.columns)))
+    ax2.set_yticklabels(df_plot.columns)
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Industry')
+    ax2.set_title(f'HRP Industry Weights Heatmap {title_suffix}', fontsize=12, fontweight='bold')
+    
+    # Set x-axis ticks (show every Nth date)
+    n_ticks = 10
+    tick_positions = np.linspace(0, len(df_plot)-1, n_ticks, dtype=int)
+    ax2.set_xticks(tick_positions)
+    ax2.set_xticklabels([df_plot.index[i].strftime('%Y-%m') for i in tick_positions], rotation=45, ha='right')
+    
+    cbar = fig.colorbar(im, ax=ax2, orientation='vertical', fraction=0.02, pad=0.02)
+    cbar.set_label('Weight')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'hrp_industry_weights_over_time.png'), dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Print summary statistics
+    print("\n" + "="*70)
+    print("HRP INDUSTRY WEIGHTS SUMMARY")
+    print("="*70)
+    print(f"\n{'Industry':<12} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8}")
+    print("-"*50)
+    for col in df.columns:
+        print(f"{col:<12} {df[col].mean():>8.1%} {df[col].std():>8.1%} {df[col].min():>8.1%} {df[col].max():>8.1%}")
+    
+    return df
+
+
+def plot_industry_dendrogram(industry_returns, date, window, output_dir):
+    """
+    Plot dendrogram for industry ETF clustering (much cleaner than 600-stock dendrogram).
+    
+    Args:
+        industry_returns: DataFrame of industry ETF returns
+        date: Target rebalancing date
+        window: Lookback window in months
+        output_dir: Directory to save plot
+    """
+    from scipy.cluster.hierarchy import linkage, dendrogram
+    from scipy.spatial.distance import squareform
+    from sklearn.covariance import LedoitWolf
+    
+    # Get window data
+    window_start = date - pd.DateOffset(months=window)
+    mask = (industry_returns.index >= window_start) & (industry_returns.index <= date)
+    window_data = industry_returns.loc[mask].dropna(axis=1, how='any')
+    
+    if window_data.shape[1] < 2:
+        print(f"Not enough industries with valid data for {date.date()}")
+        return
+    
+    # Compute correlation matrix
+    corr = window_data.corr()
+    
+    # Compute distance matrix
+    dist = np.sqrt((1 - corr) / 2.0)
+    dist_condensed = squareform(dist.values, checks=False)
+    
+    # Hierarchical clustering
+    link = linkage(dist_condensed, method='ward')
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    dendro = dendrogram(
+        link,
+        labels=window_data.columns.tolist(),
+        leaf_rotation=45,
+        leaf_font_size=11,
+        ax=ax
+    )
+    
+    ax.set_title(f'HRP Industry Dendrogram\nDate: {date.date()} | Window: {window}m | Industries: {window_data.shape[1]}',
+                 fontsize=12, fontweight='bold')
+    ax.set_xlabel('Industry')
+    ax.set_ylabel('Distance')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'industry_dendrogram_{date.date()}.png'), dpi=150)
+    plt.show()
+    
+    return dendro
     print(f"✓ Saved: {save_path}")
     return corr_raw, corr_denoised
