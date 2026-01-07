@@ -68,6 +68,10 @@ def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, outp
         industry_returns.to_csv(os.path.join(output_dir, 'industry_etf_returns.csv'))
         logger.info(f"✓ Saved industry ETF returns: {os.path.join(output_dir, 'industry_etf_returns.csv')}")
         
+        # Save within-industry VW weights for transaction cost computation
+        joblib.dump(industry_weights_dict, os.path.join(output_dir, 'within_industry_weights.pkl'))
+        logger.info(f"✓ Saved within-industry weights: {os.path.join(output_dir, 'within_industry_weights.pkl')}")
+        
         # Run HRP on industry ETFs
         strategy_returns, all_weights_dict, stock_weights_dict = _run_industry_hrp(
             industry_returns, industry_weights_dict, returns_all, 
