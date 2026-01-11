@@ -443,9 +443,6 @@ While the regime-adaptive strategy achieves a net Sharpe ratio of 0.85---a 57\% 
 Several limitations warrant mention:
 \begin{itemize}
     \item \textbf{Model-generated targets}: The XGBoost predicts HMM-inferred labels, not directly observable economic states. However, this approach helps denoise market regimes and produces strong empirical results, suggesting it may be more relevant than using raw observable signals. Future work could validate against alternative regime definitions (NBER recession dates, VIX regimes, or realized volatility thresholds)
-    \item The 2-state HMM identifies volatility regimes rather than directional market moves; both regimes have positive expected returns
-    \item While 76.5\% accuracy is adequate, the 54.5\% recall on bear predictions means some high-volatility periods are missed---the strategy balances precision and recall
-    \item Results are sensitive to the 60-month lookback window for covariance estimation; shorter windows increase noise
     \item The strategy's outperformance may partially reflect the specific sample period (1988--2024)
     \item A significant portion of the features used in the HMM and ML prediction models lack data before approximately 1975, which is why out-of-sample testing could not begin earlier than 1988
     \item \textbf{Overfitting risk}: Despite strict walk-forward protocols and purged cross-validation, projects of this nature carry inherent risk of unintentional overfitting through repeated researcher decisions on feature selection, model architecture, and hyperparameter choices
@@ -546,11 +543,7 @@ The output is a dendrogram representing the hierarchical structure of asset simi
 
 \begin{figure}[H]
     \centering
-    \fbox{\parbox{0.85\textwidth}{\centering\vspace{3cm}
-    \textbf{Figure: Industry HRP Dendrogram (December 2023)}\\[1em]
-    Single linkage clustering of 12 Fama-French industries based on correlation distance.\\
-    Adjacent industries in the quasi-diagonalized ordering exhibit higher return correlations.
-    \vspace{3cm}}}
+    \includegraphics[width=0.85\textwidth]{figures/industry_dendrogram_2023-12-29.png}
     \caption{Industry HRP dendrogram (December 2023). Single linkage clustering groups the 12 Fama-French industries based on correlation distance. Adjacent industries in the quasi-diagonalized ordering exhibit higher return correlations.}
     \label{fig:dendrogram}
 \end{figure}
