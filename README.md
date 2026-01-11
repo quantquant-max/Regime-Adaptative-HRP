@@ -92,6 +92,18 @@ HRP/
 
 ## How to Run
 
+### Main File
+
+The main file to run is located in `HRP/Codes/` and is named **`CUDA-HRP-MULTIVAR-ML-V3.ipynb`**.
+
+### Portability
+
+The code is fully portable — **no paths need to be adjusted**. All file paths are handled dynamically relative to the project structure.
+
+### GPU Acceleration
+
+If your machine has a **CUDA-compatible GPU**, the code will automatically detect it and parallelize computing tasks for faster execution. If no GPU is available, the code gracefully falls back to CPU computation.
+
 ### Execution Order
 
 1. **Open the main notebook**: `Codes/CUDA-HRP-MULTIVAR-ML-V3.ipynb`
