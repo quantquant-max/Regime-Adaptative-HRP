@@ -5,6 +5,29 @@ from hrp_logger import setup_logger
 
 logger = setup_logger()
 
+# =============================================================================
+# GPU Detection for CuPy
+# =============================================================================
+GPU_AVAILABLE = False
+cp = None
+
+def _detect_gpu():
+    """Detect if CuPy GPU is available."""
+    global GPU_AVAILABLE, cp
+    try:
+        import cupy as _cp
+        # Test GPU availability
+        _cp.array([1, 2, 3])
+        cp = _cp
+        GPU_AVAILABLE = True
+        logger.info("✓ hrp_features: CuPy GPU available")
+    except Exception as e:
+        GPU_AVAILABLE = False
+        cp = None
+        logger.info(f"[!] hrp_features: CuPy not available ({type(e).__name__}), using CPU")
+
+_detect_gpu()
+
 def _zscore(series, window):
     """
     Compute rolling Z-score using strictly ex-ante data (shifted by 1).
@@ -265,9 +288,10 @@ def compute_vix_proxy(df_universe):
     
     return vw_ret[['DATE', 'vix_proxy_z']]
 
-def compute_bab_factor(df_universe):
+def compute_bab_factor(df_universe, use_gpu: bool = None):
     """
-    Compute Betting Against Beta (BAB) Factor.
+    Compute Betting Against Beta (BAB) Factor with GPU acceleration.
+    
     Methodology (Enhanced):
     1. Compute Market Return (VW).
     2. Compute Rolling Beta (36m, min 24) for all stocks.
@@ -276,8 +300,21 @@ def compute_bab_factor(df_universe):
        - Uses LAGGED Beta (t-1) to sort, ensuring tradability.
     5. Compute Factor Momentum: Rolling 12-month cumulative return of the BAB factor.
     6. Return Z-scored Factor Momentum.
+    
+    Parameters
+    ----------
+    df_universe : pd.DataFrame
+        Universe data with RET, MKT_CAP, PERMNO, DATE columns
+    use_gpu : bool, optional
+        Force GPU (True) or CPU (False). If None, auto-detect.
     """
-    print("  - Computing BAB Factor (Vectorized)...")
+    # Determine GPU usage
+    if use_gpu is None:
+        use_gpu = GPU_AVAILABLE
+    
+    device = "GPU" if use_gpu and GPU_AVAILABLE else "CPU"
+    print(f"  - Computing BAB Factor (Vectorized) [{device}]...")
+    
     if 'in_universe_ML' in df_universe.columns:
         df = df_universe[df_universe['in_universe_ML'] == 1].copy()
     else:
@@ -294,24 +331,13 @@ def compute_bab_factor(df_universe):
     daily_sums = df.groupby('DATE')[['w_ret', 'mkt_val']].sum()
     mkt_ret = daily_sums['w_ret'] / daily_sums['mkt_val']
     
-    # --- VECTORIZED BETA (NO LOOP) ---
-    # 1. Rolling Means
-    mean_mkt = mkt_ret.rolling(36, min_periods=24).mean()
-    mean_stocks = ret_wide.rolling(36, min_periods=24).mean()
-
-    # 2. Rolling Covariance = E[XY] - E[X]E[Y]
-    # Broadcast mkt_ret to match ret_wide shape
-    ret_times_mkt = ret_wide.multiply(mkt_ret, axis=0)
-    mean_product = ret_times_mkt.rolling(36, min_periods=24).mean()
-    cov_matrix = mean_product.sub(mean_stocks.multiply(mean_mkt, axis=0))
-
-    # 3. Rolling Variance of Market
-    mkt_sq = mkt_ret ** 2
-    mean_mkt_sq = mkt_sq.rolling(36, min_periods=24).mean()
-    var_mkt = mean_mkt_sq - (mean_mkt ** 2)
-
-    # 4. Beta
-    betas = cov_matrix.div(var_mkt, axis=0)
+    # =========================================================================
+    # GPU-ACCELERATED ROLLING BETA CALCULATION
+    # =========================================================================
+    if use_gpu and GPU_AVAILABLE:
+        betas = _compute_rolling_betas_gpu(ret_wide, mkt_ret, window=36, min_periods=24)
+    else:
+        betas = _compute_rolling_betas_cpu(ret_wide, mkt_ret, window=36, min_periods=24)
     
     # Clip Outliers
     betas = betas.clip(lower=-5, upper=5)
@@ -344,6 +370,96 @@ def compute_bab_factor(df_universe):
     bab_z = _zscore(bab_12m_cum, 60)
     
     return pd.DataFrame({'DATE': bab_z.index, 'bab_z': bab_z})
+
+
+def _compute_rolling_betas_cpu(ret_wide: pd.DataFrame, mkt_ret: pd.Series, 
+                                window: int = 36, min_periods: int = 24) -> pd.DataFrame:
+    """
+    Compute rolling betas using vectorized Pandas (CPU).
+    
+    Beta = Cov(stock, market) / Var(market)
+    Using: Cov(X,Y) = E[XY] - E[X]E[Y]
+    """
+    # Rolling Means
+    mean_mkt = mkt_ret.rolling(window, min_periods=min_periods).mean()
+    mean_stocks = ret_wide.rolling(window, min_periods=min_periods).mean()
+
+    # Rolling Covariance = E[XY] - E[X]E[Y]
+    ret_times_mkt = ret_wide.multiply(mkt_ret, axis=0)
+    mean_product = ret_times_mkt.rolling(window, min_periods=min_periods).mean()
+    cov_matrix = mean_product.sub(mean_stocks.multiply(mean_mkt, axis=0))
+
+    # Rolling Variance of Market
+    mkt_sq = mkt_ret ** 2
+    mean_mkt_sq = mkt_sq.rolling(window, min_periods=min_periods).mean()
+    var_mkt = mean_mkt_sq - (mean_mkt ** 2)
+
+    # Beta = Cov / Var
+    betas = cov_matrix.div(var_mkt, axis=0)
+    
+    return betas
+
+
+def _compute_rolling_betas_gpu(ret_wide: pd.DataFrame, mkt_ret: pd.Series,
+                                window: int = 36, min_periods: int = 24) -> pd.DataFrame:
+    """
+    Compute rolling betas using CuPy GPU acceleration.
+    
+    GPU parallelizes the rolling window computation across all stocks simultaneously.
+    """
+    import cupy as cp
+    
+    # Convert to numpy then CuPy arrays
+    ret_arr = cp.asarray(ret_wide.values, dtype=cp.float32)  # (T, N) stocks
+    mkt_arr = cp.asarray(mkt_ret.values, dtype=cp.float32)   # (T,)
+    
+    T, N = ret_arr.shape
+    betas_gpu = cp.full((T, N), cp.nan, dtype=cp.float32)
+    
+    # Expand market returns for broadcasting: (T,) -> (T, 1)
+    mkt_expanded = mkt_arr[:, cp.newaxis]
+    
+    # Compute rolling betas for each starting position
+    for t in range(window - 1, T):
+        start = t - window + 1
+        
+        # Get windows: (window, N) and (window,)
+        ret_window = ret_arr[start:t+1, :]  # (window, N)
+        mkt_window = mkt_arr[start:t+1]      # (window,)
+        
+        # Check minimum valid observations per stock
+        valid_mask = ~cp.isnan(ret_window)
+        n_valid = valid_mask.sum(axis=0)  # (N,)
+        
+        # Replace NaN with 0 for computation (will mask later)
+        ret_clean = cp.where(cp.isnan(ret_window), 0, ret_window)
+        mkt_clean = cp.where(cp.isnan(mkt_window), 0, mkt_window)
+        
+        # Means (using actual counts)
+        mkt_mean = mkt_clean.sum() / window
+        ret_mean = ret_clean.sum(axis=0) / cp.maximum(n_valid, 1)  # (N,)
+        
+        # Covariance: E[XY] - E[X]E[Y]
+        xy = ret_clean * mkt_clean[:, cp.newaxis]  # (window, N)
+        mean_xy = xy.sum(axis=0) / cp.maximum(n_valid, 1)
+        cov = mean_xy - ret_mean * mkt_mean
+        
+        # Market variance
+        var_mkt = (mkt_clean ** 2).sum() / window - mkt_mean ** 2
+        
+        # Beta
+        beta_t = cov / (var_mkt + 1e-10)
+        
+        # Mask stocks with insufficient observations
+        beta_t = cp.where(n_valid >= min_periods, beta_t, cp.nan)
+        
+        betas_gpu[t, :] = beta_t
+    
+    # Transfer back to CPU and create DataFrame
+    betas_np = cp.asnumpy(betas_gpu)
+    betas_df = pd.DataFrame(betas_np, index=ret_wide.index, columns=ret_wide.columns)
+    
+    return betas_df
 
 def compute_rolling_mean_pairwise_corr(df_universe, window=12):
     """
@@ -390,39 +506,6 @@ def compute_rolling_mean_pairwise_corr(df_universe, window=12):
     
     return res[['DATE', 'avg_pairwise_corr_z']]
 
-def compute_market_rsi(df_universe, period=14):
-    """
-    Compute RSI on Value-Weighted Market Returns.
-    RSI is already bounded [0, 100], no standardization needed.
-    
-    Parameters:
-    - df_universe: DataFrame with DATE, PERMNO, RET, MKT_CAP columns
-    - period: RSI lookback period (default 14 months)
-    
-    Returns:
-    - DataFrame with DATE and rsi columns
-    """
-    logger.info(f"  - Market RSI (Period={period})")
-    
-    # Filter for in_universe_ML == 1
-    if 'in_universe_ML' in df_universe.columns:
-        df = df_universe[df_universe['in_universe_ML'] == 1].copy()
-    else:
-        df = df_universe.copy()
-    
-    # Calculate VW Market Return per date
-    df['w_ret'] = df['RET'] * df['MKT_CAP']
-    sums = df.groupby('DATE')[['w_ret', 'MKT_CAP']].sum()
-    mkt_ret = (sums['w_ret'] / sums['MKT_CAP']).sort_index()
-    
-    # Compute RSI using ta library
-    rsi_indicator = ta.momentum.RSIIndicator(mkt_ret, window=period)
-    rsi_values = rsi_indicator.rsi()
-    
-    res = pd.DataFrame({'DATE': rsi_values.index, 'rsi': rsi_values.values})
-    
-    return res[['DATE', 'rsi']]
-
 def compute_all_features(df_universe, macro_df, df_merged_comp=None):
     """
     Compute all advanced features for the entire history.
@@ -451,23 +534,20 @@ def compute_all_features(df_universe, macro_df, df_merged_comp=None):
     
     # 5. Rolling Mean Pairwise Correlation
     avg_corr = compute_rolling_mean_pairwise_corr(df_universe)
-    
-    # 6. Market RSI (already bounded 0-100, no Z-score needed)
-    rsi = compute_market_rsi(df_universe)
-    
-    # 7. Macro
+
+    # 6. Macro
     logger.info("  - Macro Features (Credit Spread, CPI Vol, M2, Unemployment)")
     macro = compute_macro_features(macro_df)
-    
-    # 8. Valuation Spread (if Compustat data provided)
+
+    # 7. Valuation Spread (if Compustat data provided)
     val_spread = pd.DataFrame(columns=['DATE', 'valuation_spread_z'])
     if df_merged_comp is not None:
         logger.info("  - Valuation Spread (Value vs Growth)")
         val_spread = compute_valuation_spread(df_merged_comp)
-    
+
     # Merge all
     # Create master index
-    all_dates = macro.index.union(disp['DATE']).union(amihud['DATE']).union(vix['DATE']).union(bab['DATE']).union(avg_corr['DATE']).union(rsi['DATE']).unique().sort_values()
+    all_dates = macro.index.union(disp['DATE']).union(amihud['DATE']).union(vix['DATE']).union(bab['DATE']).union(avg_corr['DATE']).unique().sort_values()
     if not val_spread.empty:
         all_dates = all_dates.union(val_spread['DATE']).unique().sort_values()
         
@@ -493,14 +573,10 @@ def compute_all_features(df_universe, macro_df, df_merged_comp=None):
     # Merge Avg Corr
     avg_corr.set_index('DATE', inplace=True)
     features = features.join(avg_corr, how='left')
-    
-    # Merge RSI (no Z-score, already 0-100)
-    rsi.set_index('DATE', inplace=True)
-    features = features.join(rsi, how='left')
-    
+
     # Merge Macro
     features = features.join(macro, how='left')
-    
+
     # Merge Valuation Spread
     if not val_spread.empty:
         val_spread.set_index('DATE', inplace=True)

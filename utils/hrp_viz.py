@@ -476,3 +476,183 @@ def plot_gross_vs_net_equity(
     print(f"  P(Bull) Scaled NET:   ${cum_scaled_net.iloc[-1]:,.2f} (drag: ${cum_scaled_gross.iloc[-1] - cum_scaled_net.iloc[-1]:,.2f})")
     
     return fig
+
+
+def plot_ml_features_overview(ml_features: pd.DataFrame, save_path: str = None) -> plt.Figure:
+    """
+    Plot all 14 ML features in a 7x2 grid of mini charts.
+    
+    Parameters
+    ----------
+    ml_features : pd.DataFrame
+        DataFrame with ML features (columns are feature names, index is dates)
+    save_path : str, optional
+        Path to save the figure
+        
+    Returns
+    -------
+    plt.Figure
+        Matplotlib figure with 13 mini charts
+    """
+    # Define feature categories for color coding
+    FEATURE_CATEGORIES = {
+        'Market': ['dispersion_z', 'amihud_z', 'bab_z', 'avg_pairwise_corr_z'],
+        'Macro': ['credit_spread', 'term_spread', 'cpi_vol', 'm2_growth', 'unrate_trend', 'valuation_spread_z'],
+        'HRP Momentum': ['hrp_mom_1m_z', 'hrp_mom_3m_z', 'hrp_mom_12m_z']
+    }
+    
+    # Colors for each category
+    CATEGORY_COLORS = {
+        'Market': '#1f77b4',      # Blue
+        'Macro': '#2ca02c',       # Green
+        'HRP Momentum': '#9467bd' # Purple
+    }
+    
+    # Build feature-to-category mapping
+    feature_to_category = {}
+    for cat, feats in FEATURE_CATEGORIES.items():
+        for f in feats:
+            feature_to_category[f] = cat
+    
+    # Get all 13 features in order
+    ALL_FEATURES = [
+        'dispersion_z', 'amihud_z', 'bab_z', 'avg_pairwise_corr_z',  # Market
+        'credit_spread', 'term_spread', 'cpi_vol', 'm2_growth',      # Macro
+        'unrate_trend', 'valuation_spread_z',                        # Macro (continued)
+        'hrp_mom_1m_z', 'hrp_mom_3m_z', 'hrp_mom_12m_z'              # HRP Momentum
+    ]
+    
+    # Filter to available features
+    available_features = [f for f in ALL_FEATURES if f in ml_features.columns]
+    n_features = len(available_features)
+    
+    # Create figure: 7 rows x 2 columns for 14 features
+    fig, axes = plt.subplots(7, 2, figsize=(14, 18))
+    axes = axes.flatten()
+    
+    print(f"📊 Plotting {n_features} ML Features...")
+    
+    for i, feature in enumerate(available_features):
+        ax = axes[i]
+        data = ml_features[feature].dropna()
+        
+        # Get category color
+        category = feature_to_category.get(feature, 'Other')
+        color = CATEGORY_COLORS.get(category, '#333333')
+        
+        # Plot time series
+        ax.plot(data.index, data.values, color=color, linewidth=0.8, alpha=0.8)
+        ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+        
+        # Add ±2σ bands for z-scored features
+        if feature.endswith('_z'):
+            ax.axhline(y=2, color='red', linestyle=':', linewidth=0.5, alpha=0.4)
+            ax.axhline(y=-2, color='red', linestyle=':', linewidth=0.5, alpha=0.4)
+            ax.fill_between(data.index, -2, 2, color='gray', alpha=0.1)
+        
+        # Formatting
+        ax.set_title(f"{feature} ({category})", fontsize=9, fontweight='bold', color=color)
+        ax.tick_params(axis='both', labelsize=7)
+        ax.set_xlim(data.index.min(), data.index.max())
+        
+        # Add data coverage info
+        pct_valid = data.notna().mean() * 100
+        ax.text(0.02, 0.95, f"n={len(data)}, {pct_valid:.0f}% valid", 
+                transform=ax.transAxes, fontsize=7, va='top', alpha=0.7)
+    
+    # Hide any unused subplots
+    for j in range(n_features, len(axes)):
+        axes[j].set_visible(False)
+    
+    # Add legend for categories
+    legend_elements = [plt.Line2D([0], [0], color=c, linewidth=2, label=cat) 
+                       for cat, c in CATEGORY_COLORS.items()]
+    fig.legend(handles=legend_elements, loc='upper center', ncol=4, 
+               fontsize=10, bbox_to_anchor=(0.5, 0.995))
+    
+    plt.suptitle('ML Features Overview (14 Candidate Predictors)', fontsize=14, fontweight='bold', y=1.0)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    
+    # Save figure
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"✓ Saved: {save_path}")
+    
+    return fig
+
+
+def plot_subsample_sharpe(results_df, save_path=None):
+    """
+    Plot bar chart of Sharpe ratios across sub-samples.
+    """
+    ax = results_df.plot(kind='bar', figsize=(10, 6), width=0.8)
+    plt.title('Strategy Consistency: Sharpe Ratio Across Sub-Samples', fontsize=12)
+    plt.ylabel('Annualized Sharpe Ratio')
+    plt.axhline(0, color='black', linewidth=0.5)
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+def plot_subsample_equity_curves(df_analysis, periods, market_returns=None, save_path=None):
+    """
+    Plot equity curves for each sub-sample.
+    """
+    n_periods = len(periods)
+    fig, axes = plt.subplots(1, n_periods, figsize=(6 * n_periods, 6))
+    
+    # Handle case where n_periods=1 (axes is not array)
+    if n_periods == 1:
+        axes = [axes]
+
+    # Define styles for consistency
+    styles = {
+        'HRP (Gross)': {'color': '#1f77b4', 'ls': '--', 'alpha': 0.6},
+        'HRP (Net)': {'color': '#1f77b4', 'ls': '-', 'lw': 2},
+        'Scaled (Gross)': {'color': '#ff7f0e', 'ls': '--', 'alpha': 0.6},
+        'Scaled (Net)': {'color': '#ff7f0e', 'ls': '-', 'lw': 2},
+        'Market (VW)': {'color': 'gray', 'ls': ':', 'alpha': 0.5, 'lw': 1}
+    }
+
+    for i, (start, end) in enumerate(periods):
+        ax = axes[i]
+        
+        # Select data for period
+        mask = (df_analysis.index >= start) & (df_analysis.index <= end)
+        sub_df = df_analysis.loc[mask].copy()
+        
+        # Add Market Benchmarks
+        if market_returns is not None:
+            # Align market returns using reindex
+            mkt = market_returns.reindex(sub_df.index)
+            sub_df['Market (VW)'] = mkt
+            
+        # Calculate Wealth Index (start at 1.0)
+        wealth = (1 + sub_df).cumprod()
+        # Normalize to start at 1.0
+        if not wealth.empty:
+            wealth = wealth / wealth.iloc[0]
+        
+        # Plot
+        for col in sub_df.columns:
+            style = styles.get(col, {})
+            # If column not in styles (e.g. Market check), use default
+            if col not in styles and col == 'Market (VW)': style = styles['Market (VW)']
+            
+            ax.plot(wealth.index, wealth[col], label=col, **style)
+            
+        ax.set_title(f"Period {i+1}\n{start:%Y-%m} to {end:%Y-%m}")
+        ax.set_yscale('log')
+        ax.grid(True, which="both", ls="-", alpha=0.2)
+        
+    axes[0].set_ylabel('Wealth Index (Log Scale)')
+    axes[0].legend(loc='upper left', fontsize=9, frameon=True)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()

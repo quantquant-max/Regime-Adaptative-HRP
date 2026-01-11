@@ -9,7 +9,6 @@
 import pandas as pd
 import numpy as np
 import scipy.cluster.hierarchy as sch
-from sklearn.covariance import LedoitWolf
 import time
 import os
 from datetime import datetime
@@ -21,20 +20,6 @@ try:
 except ImportError:
     def get_random_state():
         return 42
-
-# Import RMT (Random Matrix Theory Denoising)
-try:
-    # Try importing your new local script
-    from cov_shrinkage import compute_rmt
-    print("✓ SOTA Covariance (RMT Denoising) loaded successfully.")
-except ImportError:
-    # Fallback only if file is missing
-    from sklearn.covariance import LedoitWolf
-    print("[!] cov_shrinkage.py not found. Using Linear Shrinkage (Inferior).")
-    
-    def compute_rmt(X):
-        lw = LedoitWolf()
-        return lw.fit(X).covariance_
 
 # Initialize GPU_AVAILABLE at module level
 GPU_AVAILABLE = False
@@ -76,31 +61,25 @@ def get_euclidean_distance_gpu(dist_gpu):
 
 def compute_covariance_gpu(returns_np, use_gpu=True):
     """
-    Compute shrunk covariance using RMT Denoising on CPU,
+    Compute sample covariance matrix on CPU,
     then transfer to GPU if available.
+    
+    Note: Using pure sample covariance since N=12 industries < T=60 months
+    ensures a stable, full-rank covariance matrix.
     
     Returns:
         cov_array (np.ndarray): Covariance matrix on CPU
-        shrinkage (float): Shrinkage coefficient (Dummy 0.0 for RMT)
         cov_gpu (cp.ndarray or None): Covariance matrix on GPU if available
     """
-    # RMT Denoising (Random Matrix Theory)
-    try:
-        cov_array = compute_rmt(returns_np)
-        shrinkage = 0.0 # RMT is analytical, no single shrinkage coefficient
-    except Exception as e:
-        print(f"[!] RMT Failed ({e}). Fallback to Linear Shrinkage.")
-        lw = LedoitWolf()
-        lw.fit(returns_np)
-        cov_array = lw.covariance_
-        shrinkage = lw.shrinkage_
+    # Pure sample covariance (stable for N=12 < T=60)
+    cov_array = np.cov(returns_np, rowvar=False, ddof=1)
     
     # Transfer to GPU if available
     if GPU_AVAILABLE and use_gpu:
         cov_gpu = cp.asarray(cov_array, dtype=cp.float32)  # Use float32 for faster GPU ops
-        return cov_array, shrinkage, cov_gpu
+        return cov_array, cov_gpu
     else:
-        return cov_array, shrinkage, None
+        return cov_array, None
 
 def get_quasi_diag(link):
     """
@@ -250,13 +229,8 @@ def compute_hrp_weights(returns_df, variance_window=None, debug=False, use_gpu=T
 
     # Step 1: Compute covariance matrix for CORRELATION (Clustering)
     # Uses the full provided history (e.g., 60 months)
-    # Use RMT Denoising (Random Matrix Theory)
-    try:
-        cov_corr_array = compute_rmt(returns_np)
-    except Exception as e:
-        raise RuntimeError(f"RMT Covariance Estimation failed for input shape {returns_np.shape}. Error: {str(e)}")
-        
-    shrinkage = 0.0 # RMT doesn't return a single shrinkage coefficient
+    # Pure sample covariance (stable for N=12 industries < T=60 months)
+    cov_corr_array = np.cov(returns_np, rowvar=False, ddof=1)
     if GPU_AVAILABLE and use_gpu:
         cov_gpu = cp.asarray(cov_corr_array, dtype=cp.float32)
     else:
@@ -326,61 +300,3 @@ def compute_hrp_weights(returns_df, variance_window=None, debug=False, use_gpu=T
         hrp_weights /= weight_sum
 
     return hrp_weights
-
-
-def compute_hrp_weights_batch(returns_dict, debug=False, use_gpu=True, max_batch_size=5):
-    """
-    Batch computation of HRP weights for multiple windows/dates.
-    Optimized for GPU with memory-efficient processing.
-    
-    Args:
-        returns_dict (dict): Dictionary of {key: returns_df} where key is (date, window) or similar
-        debug (bool): Print debug information
-        use_gpu (bool): Use GPU acceleration if available
-        max_batch_size (int): Maximum number of portfolios to process in GPU memory at once
-    
-    Returns:
-        dict: Dictionary of {key: weights_series}
-    
-    Example:
-        returns_dict = {
-            (date1, 6): returns_df_6m,
-            (date1, 12): returns_df_12m,
-            ...
-        }
-        weights_dict = compute_hrp_weights_batch(returns_dict)
-    """
-    results = {}
-    keys = list(returns_dict.keys())
-    
-    print(f"Processing {len(keys)} HRP computations in batches of {max_batch_size}...")
-    
-    # Process in batches to avoid GPU memory overflow
-    for batch_start in range(0, len(keys), max_batch_size):
-        batch_end = min(batch_start + max_batch_size, len(keys))
-        batch_keys = keys[batch_start:batch_end]
-        
-        if debug:
-            print(f"  Batch {batch_start//max_batch_size + 1}: Processing {len(batch_keys)} portfolios...")
-        
-        # Process each item in batch
-        for key in batch_keys:
-            returns_df = returns_dict[key]
-            try:
-                weights = compute_hrp_weights(returns_df, debug=False, use_gpu=use_gpu)
-                results[key] = weights
-            except (ValueError, RuntimeError) as e:
-                if debug:
-                    print(f"    Skipped {key}: {str(e)[:60]}")
-                results[key] = None  # Mark as failed
-        
-        # Clear GPU memory between batches
-        if GPU_AVAILABLE and use_gpu:
-            cp.get_default_memory_pool().free_all_blocks()
-    
-    # Filter out failed computations
-    results = {k: v for k, v in results.items() if v is not None}
-    
-    print(f"✓ Successfully computed {len(results)}/{len(keys)} portfolios")
-    
-    return results

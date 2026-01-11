@@ -74,6 +74,28 @@ def get_rng() -> np.random.Generator:
         GLOBAL_RNG = np.random.default_rng(GLOBAL_SEED)
     return GLOBAL_RNG
 
+
+def find_file(filename, search_paths):
+    """
+    Search for a file in a list of directories.
+    Independent implementation to avoid circular dependencies during setup.
+    """
+    for path in search_paths:
+        if not os.path.exists(path):
+            continue
+            
+        # Check direct path
+        full_path = os.path.join(path, filename)
+        if os.path.exists(full_path):
+            return full_path
+        
+        # Recursive search
+        for root, dirs, files in os.walk(path):
+            if filename in files:
+                return os.path.join(root, filename)
+    return None
+
+
 def setup_environment(current_dir):
     """
     Sets up the environment:
@@ -140,7 +162,13 @@ def get_file_paths(project_root, hrp_data):
             os.path.join(project_root, 'DATA'),
             project_root
         ]
-        path = hrp_data.find_file(filename, search_paths=search_dirs)
+        # Use local find_file instead of relying on passed module
+        path = find_file(filename, search_paths=search_dirs)
+        if path is None:
+            # Fallback to module if local failed (unlikely, but safe)
+            if hasattr(hrp_data, 'find_file'):
+                path = hrp_data.find_file(filename, search_paths=search_dirs)
+            
         if path is None:
             raise FileNotFoundError(f"Could not find {filename}")
         return path

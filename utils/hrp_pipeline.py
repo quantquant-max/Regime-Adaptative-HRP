@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import joblib
+import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -14,9 +15,42 @@ from hrp_logger import setup_logger
 logger = setup_logger()
 
 
+def _safe_save(save_func, filepath, max_retries=3, retry_delay=1.0):
+    """
+    Safely save a file with retry logic for OneDrive sync issues.
+    
+    Args:
+        save_func: Callable that performs the save (e.g., lambda: joblib.dump(data, path))
+        filepath: Path being saved (for logging)
+        max_retries: Number of retry attempts
+        retry_delay: Seconds to wait between retries
+    """
+    for attempt in range(max_retries):
+        try:
+            save_func()
+            return True
+        except OSError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"  Save failed (attempt {attempt+1}/{max_retries}): {filepath}")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"  Failed to save after {max_retries} attempts: {filepath}")
+                logger.error(f"  Error: {e}")
+                # Try alternative: save to temp then rename
+                try:
+                    temp_path = filepath + '.tmp'
+                    save_func_temp = lambda: save_func.__self__ if hasattr(save_func, '__self__') else save_func()
+                    # For joblib.dump, we need to handle differently
+                    logger.info(f"  Skipping pickle save due to OneDrive lock: {os.path.basename(filepath)}")
+                    return False
+                except:
+                    return False
+    return False
+
+
 def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, output_dir, 
                         universe_flags=None, df_universe=None, use_industry_etfs=True,
-                        min_stocks_per_industry=3):
+                        min_stocks_per_industry=3, use_gpu=True):
     """
     Compute HRP weights and monthly returns using two-stage approach:
     
@@ -35,6 +69,7 @@ def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, outp
         df_universe: Full CRSP DataFrame with FF_12, MKT_CAP columns (required for industry ETFs)
         use_industry_etfs: If True, use two-stage industry ETF approach (recommended)
         min_stocks_per_industry: Minimum stocks per industry to include
+        use_gpu: If True, attempt GPU acceleration via cuDF (falls back to CPU if unavailable)
         
     Returns:
         strategy_returns: Series of monthly HRP returns
@@ -55,10 +90,11 @@ def run_hrp_computation(returns_all, valid_rebal_dates, window, min_stocks, outp
         if df_universe is None:
             raise ValueError("df_universe required for industry ETF mode. Pass the full CRSP DataFrame.")
         
-        # Compute industry ETF returns
+        # Compute industry ETF returns (GPU-accelerated if available)
         industry_returns, industry_weights_dict, industry_counts = hrp_data.compute_industry_etf_returns(
             df_universe, returns_all, universe_flags, 
-            min_stocks_per_industry=min_stocks_per_industry
+            min_stocks_per_industry=min_stocks_per_industry,
+            use_gpu=use_gpu
         )
         
         # Save industry counts for analysis
@@ -132,6 +168,9 @@ def _run_industry_hrp(industry_returns, industry_weights_dict, returns_all,
         logger.info("Starting HRP computation from scratch...")
 
     logger.info(f"Total rebalance dates: {len(valid_rebal_dates)}")
+    
+    # Track missing returns for summary (instead of verbose per-date warnings)
+    missing_returns_log = []  # List of (date, n_missing) tuples
 
     for idx, rebal_date in enumerate(tqdm(valid_rebal_dates[start_idx:], desc="Computing Industry HRP", 
                                           initial=start_idx, total=len(valid_rebal_dates))):
@@ -220,7 +259,7 @@ def _run_industry_hrp(industry_returns, industry_weights_dict, returns_all,
             next_month_ret = next_returns[valid_permnos].copy()
             n_missing = next_month_ret.isna().sum().sum()
             if n_missing > 0:
-                logger.warning(f"  {rebal_date.date()}: {n_missing} missing returns treated as -100% loss")
+                missing_returns_log.append((rebal_date, n_missing))
             next_month_ret = next_month_ret.fillna(-1.0)
             
             # Compute portfolio return
@@ -246,19 +285,42 @@ def _run_industry_hrp(industry_returns, industry_weights_dict, returns_all,
             }, checkpoint_file)
 
     # ==========================================================================
-    # SAVE OUTPUTS
+    # MISSING RETURNS SUMMARY (delistings treated as -100% loss)
     # ==========================================================================
+    if missing_returns_log:
+        total_missing = sum(n for _, n in missing_returns_log)
+        months_affected = len(missing_returns_log)
+        mean_per_month = total_missing / months_affected if months_affected > 0 else 0
+        logger.info(f"  Missing returns summary: {total_missing} total across {months_affected} months "
+                    f"(mean: {mean_per_month:.1f}/month, treated as -100% delisting loss)")
+    
+    # ==========================================================================
+    # SAVE OUTPUTS (CSV first - more reliable with OneDrive)
+    # ==========================================================================
+    
+    # Save CSV files first (essential outputs)
     strategy_returns.to_csv(os.path.join(output_dir, 'hrp_strategy_returns.csv'))
-    joblib.dump(all_weights_dict, os.path.join(output_dir, 'hrp_industry_weights_dict.pkl'))
-    joblib.dump(stock_weights_dict, os.path.join(output_dir, 'hrp_weights_dict.pkl'))
+    logger.info(f"  ✓ Saved: hrp_strategy_returns.csv")
     
     # Save industry weights to CSV
     industry_weights_df = pd.DataFrame(all_weights_dict).T.sort_index()
     industry_weights_df.to_csv(os.path.join(output_dir, 'hrp_industry_weights.csv'))
+    logger.info(f"  ✓ Saved: hrp_industry_weights.csv")
     
     # Save stock weights to CSV
     stock_weights_df = pd.DataFrame(stock_weights_dict).T.sort_index()
     stock_weights_df.to_csv(os.path.join(output_dir, 'all_hrp_weights.csv'))
+    logger.info(f"  ✓ Saved: all_hrp_weights.csv")
+    
+    # Save pickle files (optional - may fail due to OneDrive sync)
+    # These are redundant since we have CSVs, but useful for faster reloading
+    try:
+        joblib.dump(all_weights_dict, os.path.join(output_dir, 'hrp_industry_weights_dict.pkl'))
+        joblib.dump(stock_weights_dict, os.path.join(output_dir, 'hrp_weights_dict.pkl'))
+        logger.info(f"  ✓ Saved: pickle files (optional cache)")
+    except OSError as e:
+        logger.warning(f"  ⚠ Pickle save skipped (OneDrive sync): {e}")
+        logger.info(f"  ℹ CSV files saved successfully - pickle files are optional cache")
 
     # Clean up checkpoint
     if os.path.exists(checkpoint_file):
@@ -272,115 +334,8 @@ def _run_industry_hrp(industry_returns, industry_weights_dict, returns_all,
     return strategy_returns, all_weights_dict, stock_weights_dict
 
 
-def _run_direct_stock_hrp(returns_all, valid_rebal_dates, window, min_stocks, output_dir, universe_flags):
-    """
-    Legacy direct stock HRP (N>>T, statistically questionable).
-    Kept for backward compatibility and comparison.
-    """
-    strategy_returns = pd.Series(index=valid_rebal_dates, dtype=float, name=f'HRP_{window}m')
-    all_weights_dict = {}
-    
-    checkpoint_file = os.path.join(output_dir, 'hrp_checkpoint.pkl')
-    start_idx = 0
-    
-    if os.path.exists(checkpoint_file):
-        logger.info(f"Found checkpoint file. Loading previous progress...")
-        checkpoint = joblib.load(checkpoint_file)
-        strategy_returns = checkpoint['strategy_returns']
-        all_weights_dict = checkpoint.get('all_weights_dict', {})
-        start_idx = checkpoint['last_completed_idx'] + 1
-        logger.info(f"Resuming from rebalance {start_idx}/{len(valid_rebal_dates)}")
-    else:
-        logger.info("Starting HRP computation from scratch...")
-
-    logger.info(f"Total rebalance dates: {len(valid_rebal_dates)}")
-    logger.info(f"Window: {window} months")
-
-    for idx, rebal_date in enumerate(tqdm(valid_rebal_dates[start_idx:], desc="Computing HRP", initial=start_idx, total=len(valid_rebal_dates))):
-        next_start = rebal_date + pd.DateOffset(days=1)
-        next_end = (rebal_date + pd.DateOffset(months=1)) + pd.tseries.offsets.MonthEnd(0)
-        next_returns_df = returns_all.loc[next_start:next_end]
-        
-        if next_returns_df.empty:
-            continue
-
-        if universe_flags is not None:
-            if rebal_date in universe_flags.index:
-                current_flags = universe_flags.loc[rebal_date]
-                potential_universe = current_flags[current_flags == 1].index
-                
-                # Get stocks with full data history for the window (NO future tradability check)
-                window_start = rebal_date - pd.DateOffset(months=window)
-                valid_universe = returns_all.loc[window_start:rebal_date, potential_universe].dropna(axis=1, how='any').columns
-            else:
-                valid_universe = []
-        else:
-            window_start = rebal_date - pd.DateOffset(months=window)
-            valid_universe = returns_all.loc[window_start:rebal_date].dropna(axis=1, how='any').columns
-        
-        if len(valid_universe) < min_stocks:
-            continue
-
-        # Get returns for the window
-        window_start = rebal_date - pd.DateOffset(months=window)
-        window_returns = returns_all.loc[window_start:rebal_date][valid_universe]
-
-        try:
-            weights = hrp_functions.compute_hrp_weights(window_returns)
-            
-            # Check for Identity Risk (Shrinkage Saturation)
-            risk = hrp_analytics.check_identity_risk(weights)
-            if risk['is_identity']:
-                logger.warning(f"  [!] Warning: Weights are identical to Equal Weight (MAD={risk['mad_ew']:.6f}). Shrinkage likely saturated.")
-
-            all_weights_dict[rebal_date] = weights
-            
-            weights_aligned = weights[valid_universe]
-            
-            # Get next month returns and handle missing values (strict compliance)
-            # Missing returns are treated as -1 (total loss) to avoid look-ahead bias
-            next_month_returns = next_returns_df[valid_universe].copy()
-            n_missing = next_month_returns.isna().sum().sum()
-            if n_missing > 0:
-                missing_stocks = next_month_returns.columns[next_month_returns.isna().any()].tolist()
-                logger.warning(f"  [!] {rebal_date.date()}: {n_missing} missing returns treated as -100% loss. Stocks: {missing_stocks[:5]}{'...' if len(missing_stocks) > 5 else ''}")
-            next_month_returns = next_month_returns.fillna(-1.0)  # Total loss for missing returns
-            
-            port_ret_series = next_month_returns.dot(weights_aligned)
-            
-            if len(port_ret_series) > 0:
-                month_ret = (1 + port_ret_series).prod() - 1
-                strategy_returns.loc[rebal_date] = month_ret
-                
-        except Exception as e:
-            logger.error(f"Error at {rebal_date}: {e}")
-            pass
-
-        # Save checkpoint periodically
-        if (start_idx + idx) % 20 == 0:
-            joblib.dump({
-                'strategy_returns': strategy_returns,
-                'all_weights_dict': all_weights_dict,
-                'last_completed_idx': start_idx + idx
-            }, checkpoint_file)
-
-    # Save final outputs
-    strategy_returns.to_csv(os.path.join(output_dir, 'hrp_strategy_returns.csv'))
-    joblib.dump(all_weights_dict, os.path.join(output_dir, 'hrp_weights_dict.pkl'))
-    
-    # Save weights to CSV for inspection
-    weights_df = pd.DataFrame(all_weights_dict).T.sort_index()
-    weights_df.to_csv(os.path.join(output_dir, 'all_hrp_weights.csv'))
-
-    # Clean up checkpoint
-    if os.path.exists(checkpoint_file):
-        os.remove(checkpoint_file)
-
-    logger.info(f"✓ HRP Computation Completed.")
-    logger.info(f"  - Strategy returns saved to {os.path.join(output_dir, 'hrp_strategy_returns.csv')}")
-    logger.info(f"  - Weights saved to {os.path.join(output_dir, 'all_hrp_weights.csv')}")
-    
-    return strategy_returns
+# NOTE: _run_direct_stock_hrp (legacy ~600 stock mode) removed
+# Two-stage industry ETF approach is now the only supported mode
 
 
 def run_backtest(strategy_returns, rf_monthly_aligned, output_dir, market_returns=None):

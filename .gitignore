@@ -82,8 +82,10 @@ Thumbs.db
 *.log
 hrp_agent.log
 
-# Data files (large CSVs in DATA folder - uncomment if you want to exclude)
-# DATA/
+# Large data files (exceed GitHub 100MB limit)
+DATA/CRSP/CRSP_selected_columns.csv
+DATA/CRSP/CRSP_value_weighted_returns.csv
+DATA/Compustat/compustat_selected_columns.csv
 
 # Super Agent Output (model outputs - keep tracked for reproducibility)
 # Super_Agent_Output/

@@ -2,25 +2,46 @@ import pandas as pd
 import numpy as np
 import os
 
+# GPU Support - try to import CuPy and cuDF for CUDA acceleration
+GPU_AVAILABLE = False
+cp = None
+cudf = None
 
-def find_file(filename, search_paths=['DATA', '.']):
-    """Recursively find a file starting from search paths."""
-    if isinstance(search_paths, str):
-        search_paths = [search_paths]
-        
+try:
+    import cupy as cp
+    # Test that CuPy actually works
+    _ = cp.zeros(1)
+    GPU_AVAILABLE = True
+except (ImportError, Exception):
+    GPU_AVAILABLE = False
+    cp = None
+
+# Try cuDF for GPU-accelerated DataFrames (optional, faster for groupby)
+try:
+    import cudf
+except (ImportError, Exception):
+    cudf = None
+
+
+def find_file(filename, search_paths):
+    """
+    Search for a file in a list of directories.
+    """
     for path in search_paths:
-        if os.path.exists(path):
-            for root, dirs, files in os.walk(path):
-                if filename in files:
-                    return os.path.join(root, filename)
+        if not os.path.exists(path):
+            continue
+            
+        # Check direct path
+        full_path = os.path.join(path, filename)
+        if os.path.exists(full_path):
+            return full_path
+        
+        # Recursive search
+        for root, dirs, files in os.walk(path):
+            if filename in files:
+                return os.path.join(root, filename)
     return None
 
-def get_quarterly_dates(dates):
-    df_dates = pd.DataFrame({'date': dates})
-    df_dates['year'] = df_dates['date'].dt.year
-    df_dates['quarter'] = df_dates['date'].dt.quarter
-    quarterly_ends = df_dates.groupby(['year', 'quarter'])['date'].max()
-    return quarterly_ends.tolist()
 
 def get_monthly_dates(dates):
     df_dates = pd.DataFrame({'date': dates})
@@ -226,8 +247,9 @@ def load_market_data(data_path, benchmark_path, start_date_str='1960-01-01', mar
         rebalance_dates = get_monthly_dates(dates_filtered)
         print(f"  Monthly rebalance dates (from {start_date.year}): {len(rebalance_dates)}")
     else:
-        rebalance_dates = get_quarterly_dates(dates_filtered)
-        print(f"  Quarterly rebalance dates (from {start_date.year}): {len(rebalance_dates)}")
+        # Default to Monthly if not specified
+        rebalance_dates = get_monthly_dates(dates_filtered)
+        print(f"  WARNING: Frequency '{freq}' not supported or removed. Defaulting to Monthly dates.")
 
     # Filter returns matrix to date range
     returns_all = returns_all.loc[dates_filtered]
@@ -244,9 +266,12 @@ def load_market_data(data_path, benchmark_path, start_date_str='1960-01-01', mar
         print(f"✓ Market index {market_index} verified in combined data")
 
     # Filter valid rebal dates with enough history
+    # Need window months for HRP covariance + 12 months for liquidity filter burn-in
     max_win = max(windows)
-    valid_rebal_dates = [d for d in rebalance_dates if (d - dates_filtered.min()).days / 30 >= max_win]
-    print(f"Valid rebal dates for all windows: {len(valid_rebal_dates)}")
+    liquidity_burnin = 12  # Rolling 12-month median requires min 6 months, add 12 for safety
+    total_burnin = max_win + liquidity_burnin
+    valid_rebal_dates = [d for d in rebalance_dates if (d - dates_filtered.min()).days / 30 >= total_burnin]
+    print(f"Valid rebal dates (window={max_win}m + liquidity burn-in={liquidity_burnin}m): {len(valid_rebal_dates)}")
     
     # Return df_universe for industry ETF computation (contains FF_12, MKT_CAP, etc.)
     # Filter df_universe to same date range
@@ -276,9 +301,11 @@ FF12_INDUSTRY_NAMES = {
 }
 
 
-def compute_industry_etf_returns(df_universe, returns_all, universe_flags, min_stocks_per_industry=3):
+def compute_industry_etf_returns(df_universe, returns_all, universe_flags, min_stocks_per_industry=3, use_gpu=True):
     """
     Compute value-weighted industry ETF returns for Fama-French 12 industries.
+    
+    GPU-ACCELERATED (cuDF) or VECTORIZED CPU (pandas) implementation.
     
     This creates 12 synthetic ETFs from the HRP-filtered universe, enabling
     statistically valid HRP allocation (N=12 < T=60).
@@ -293,6 +320,8 @@ def compute_industry_etf_returns(df_universe, returns_all, universe_flags, min_s
         Binary flags (dates x PERMNOs) indicating HRP universe membership
     min_stocks_per_industry : int
         Minimum stocks required per industry (industries with fewer are excluded)
+    use_gpu : bool
+        Whether to attempt GPU acceleration (falls back to CPU if unavailable)
     
     Returns
     -------
@@ -303,8 +332,14 @@ def compute_industry_etf_returns(df_universe, returns_all, universe_flags, min_s
     industry_counts : pd.DataFrame
         Number of stocks per industry per date (for diagnostics)
     """
+    # Check GPU availability
+    use_cuda = use_gpu and GPU_AVAILABLE and cudf is not None
+    
     print(f"\n{'='*70}")
-    print("COMPUTING VALUE-WEIGHTED INDUSTRY ETF RETURNS")
+    if use_cuda:
+        print("COMPUTING VALUE-WEIGHTED INDUSTRY ETF RETURNS (GPU/cuDF)")
+    else:
+        print("COMPUTING VALUE-WEIGHTED INDUSTRY ETF RETURNS (CPU/pandas)")
     print(f"{'='*70}")
     
     # Ensure FF_12 column exists
@@ -315,74 +350,164 @@ def compute_industry_etf_returns(df_universe, returns_all, universe_flags, min_s
     df_hrp = df_universe[df_universe['in_universe_hrp'] == 1].copy()
     print(f"HRP Universe: {len(df_hrp)} stock-month observations")
     print(f"Unique stocks: {df_hrp['PERMNO'].nunique()}")
-    
-    # Get unique dates from returns_all
-    dates = returns_all.index
-    
-    # Initialize output containers
-    industry_returns = pd.DataFrame(index=dates, columns=list(FF12_INDUSTRY_NAMES.keys()), dtype=float)
-    industry_weights = {}  # {date: {industry: {permno: weight_within_industry}}}
-    industry_counts = pd.DataFrame(index=dates, columns=list(FF12_INDUSTRY_NAMES.keys()), dtype=float)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CRITICAL FIX: LAG MARKET CAP (Look-Ahead Bias Correction)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # We must use START-of-period market cap (t-1) to weight period t returns.
+    # Using t market cap introduces look-ahead bias (weights include t price movement).
+    print("  [!] Lagging Market Cap for VW weighting (Look-ahead bias correction)...")
+    df_hrp = df_hrp.sort_values(['PERMNO', 'DATE'])
+    # Compute lag
+    df_hrp['MKT_CAP'] = df_hrp.groupby('PERMNO')['MKT_CAP'].shift(1)
+    # Drop first month for each stock (where lagged cap is NaN)
+    n_before = len(df_hrp)
+    df_hrp = df_hrp.dropna(subset=['MKT_CAP'])
+    print(f"      Dropped {n_before - len(df_hrp)} observations due to lagging")
     
     # Convert PERMNO to string for matching with returns_all columns
     df_hrp['PERMNO_STR'] = df_hrp['PERMNO'].astype(str)
     
-    for date in dates:
-        # Get stocks in universe on this date
-        date_data = df_hrp[df_hrp['DATE'] == date].copy()
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PREPARE RETURNS IN LONG FORMAT (same for GPU and CPU)
+    # ═══════════════════════════════════════════════════════════════════════════
+    returns_long = returns_all.reset_index().melt(
+        id_vars='DATE', 
+        var_name='PERMNO_STR', 
+        value_name='RET_FROM_MATRIX'
+    )
+    returns_long['DATE'] = pd.to_datetime(returns_long['DATE'])
+    
+    if use_cuda:
+        # ═══════════════════════════════════════════════════════════════════════
+        # GPU PATH: Use cuDF for accelerated groupby operations
+        # ═══════════════════════════════════════════════════════════════════════
+        print("  → Transferring data to GPU...")
         
-        if len(date_data) == 0:
-            continue
+        # Convert to cuDF DataFrames
+        gdf_hrp = cudf.DataFrame.from_pandas(df_hrp[['DATE', 'PERMNO', 'PERMNO_STR', 'FF_12', 'MKT_CAP', 'RET']])
+        gdf_returns = cudf.DataFrame.from_pandas(returns_long)
         
+        # Step 1: Compute value weights within each (date, industry) group
+        print("  → Computing value weights on GPU...")
+        gdf_hrp['total_cap_by_date_ind'] = gdf_hrp.groupby(['DATE', 'FF_12'])['MKT_CAP'].transform('sum')
+        gdf_hrp['vw_weight'] = gdf_hrp['MKT_CAP'] / gdf_hrp['total_cap_by_date_ind']
+        
+        # Step 2: Count stocks per (date, industry)
+        gdf_hrp['stock_count'] = gdf_hrp.groupby(['DATE', 'FF_12'])['PERMNO'].transform('count')
+        
+        # Step 3: Merge returns
+        print("  → Merging returns on GPU...")
+        gdf_hrp = gdf_hrp.merge(gdf_returns, on=['DATE', 'PERMNO_STR'], how='left')
+        
+        # Use RET from merge if available, else original RET
+        gdf_hrp['RET_CLEAN'] = gdf_hrp['RET_FROM_MATRIX'].fillna(gdf_hrp['RET']).fillna(0)
+        
+        # Step 4: Filter to industries with enough stocks
+        gdf_valid = gdf_hrp[gdf_hrp['stock_count'] >= min_stocks_per_industry]
+        
+        # Step 5: Compute weighted returns
+        gdf_valid['weighted_ret'] = gdf_valid['vw_weight'] * gdf_valid['RET_CLEAN']
+        
+        # Step 6: Aggregate to get industry returns
+        print("  → Aggregating industry returns on GPU...")
+        industry_returns_long = gdf_valid.groupby(['DATE', 'FF_12'])['weighted_ret'].sum().reset_index()
+        industry_returns_long.columns = ['DATE', 'FF_12', 'vw_return']
+        
+        # Step 7: Compute stock counts
+        industry_counts_long = gdf_hrp.groupby(['DATE', 'FF_12'])['PERMNO'].count().reset_index()
+        industry_counts_long.columns = ['DATE', 'FF_12', 'count']
+        
+        # Transfer back to pandas for pivot (cuDF pivot is limited)
+        print("  → Transferring results back to CPU...")
+        industry_returns_long = industry_returns_long.to_pandas()
+        industry_counts_long = industry_counts_long.to_pandas()
+        
+        # Get df_hrp back to pandas for weights dict construction
+        df_hrp = gdf_hrp.to_pandas()
+        
+    else:
+        # ═══════════════════════════════════════════════════════════════════════
+        # CPU PATH: Use pandas vectorized operations
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Step 1: Compute value weights within each (date, industry) group
+        df_hrp['total_cap_by_date_ind'] = df_hrp.groupby(['DATE', 'FF_12'])['MKT_CAP'].transform('sum')
+        df_hrp['vw_weight'] = df_hrp['MKT_CAP'] / df_hrp['total_cap_by_date_ind']
+        
+        # Step 2: Count stocks per (date, industry)
+        df_hrp['stock_count'] = df_hrp.groupby(['DATE', 'FF_12'])['PERMNO'].transform('count')
+        
+        # Step 3: Merge returns
+        df_hrp = df_hrp.merge(returns_long, on=['DATE', 'PERMNO_STR'], how='left')
+        
+        # Use RET from merge if available, else original RET
+        df_hrp['RET_CLEAN'] = df_hrp['RET_FROM_MATRIX'].fillna(df_hrp['RET']).fillna(0)
+        
+        # Step 4: Filter to industries with enough stocks
+        df_valid = df_hrp[df_hrp['stock_count'] >= min_stocks_per_industry].copy()
+        
+        # Step 5: Compute weighted returns
+        df_valid['weighted_ret'] = df_valid['vw_weight'] * df_valid['RET_CLEAN']
+        
+        # Step 6: Aggregate to get industry returns
+        industry_returns_long = df_valid.groupby(['DATE', 'FF_12'])['weighted_ret'].sum().reset_index()
+        industry_returns_long.columns = ['DATE', 'FF_12', 'vw_return']
+        
+        # Step 7: Compute stock counts
+        industry_counts_long = df_hrp.groupby(['DATE', 'FF_12'])['PERMNO'].count().reset_index()
+        industry_counts_long.columns = ['DATE', 'FF_12', 'count']
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # COMMON PATH: Pivot and finalize (pandas)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    # Pivot to wide format
+    industry_returns = industry_returns_long.pivot(index='DATE', columns='FF_12', values='vw_return')
+    industry_returns = industry_returns.sort_index()
+    
+    industry_counts = industry_counts_long.pivot(index='DATE', columns='FF_12', values='count')
+    industry_counts = industry_counts.sort_index()
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # BUILD INDUSTRY WEIGHTS DICT (still needed for two-stage tx cost model)
+    # This is optimized using groupby instead of nested loops
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("Building within-industry weights dictionary...")
+    
+    # Filter to valid industries only
+    df_weights = df_hrp[df_hrp['stock_count'] >= min_stocks_per_industry][
+        ['DATE', 'FF_12', 'PERMNO_STR', 'vw_weight']
+    ].copy()
+    
+    # Group and convert to nested dict efficiently
+    industry_weights = {}
+    for date in df_weights['DATE'].unique():
+        date_data = df_weights[df_weights['DATE'] == date]
         industry_weights[date] = {}
-        
-        for ind_id in FF12_INDUSTRY_NAMES.keys():
-            # Get stocks in this industry
-            ind_stocks = date_data[date_data['FF_12'] == ind_id]
-            
-            # Record count
-            industry_counts.loc[date, ind_id] = len(ind_stocks)
-            
-            if len(ind_stocks) < min_stocks_per_industry:
-                # Not enough stocks - leave as NaN
-                industry_weights[date][ind_id] = {}
-                continue
-            
-            # Calculate value weights within industry (market cap weighted)
-            mkt_caps = ind_stocks.set_index('PERMNO_STR')['MKT_CAP']
-            total_cap = mkt_caps.sum()
-            
-            if total_cap <= 0:
-                industry_weights[date][ind_id] = {}
-                continue
-            
-            # Value weights (sum to 1 within industry)
-            vw_weights = mkt_caps / total_cap
-            industry_weights[date][ind_id] = vw_weights.to_dict()
-            
-            # Get returns for these stocks
-            permnos = ind_stocks['PERMNO_STR'].tolist()
-            valid_permnos = [p for p in permnos if p in returns_all.columns]
-            
-            if len(valid_permnos) == 0:
-                continue
-            
-            # Get return for this date
-            stock_returns = returns_all.loc[date, valid_permnos]
-            
-            # Align weights with available returns
-            aligned_weights = vw_weights.reindex(valid_permnos).fillna(0)
-            aligned_weights = aligned_weights / aligned_weights.sum()  # Renormalize
-            
-            # Compute value-weighted return (handle NaN returns as 0)
-            stock_returns_clean = stock_returns.fillna(0)
-            industry_ret = (stock_returns_clean * aligned_weights).sum()
-            
-            industry_returns.loc[date, ind_id] = industry_ret
+        for ind_id in date_data['FF_12'].unique():
+            ind_data = date_data[date_data['FF_12'] == ind_id]
+            industry_weights[date][ind_id] = dict(zip(ind_data['PERMNO_STR'], ind_data['vw_weight']))
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RENAME COLUMNS AND FINALIZE
+    # ═══════════════════════════════════════════════════════════════════════════
     
     # Rename columns to industry names
-    industry_returns.columns = [FF12_INDUSTRY_NAMES[c] for c in industry_returns.columns]
-    industry_counts.columns = [FF12_INDUSTRY_NAMES[c] for c in industry_counts.columns]
+    industry_returns.columns = [FF12_INDUSTRY_NAMES.get(c, c) for c in industry_returns.columns]
+    industry_counts.columns = [FF12_INDUSTRY_NAMES.get(c, c) for c in industry_counts.columns]
+    
+    # Ensure all 12 industries are present (add missing as NaN)
+    all_industries = list(FF12_INDUSTRY_NAMES.values())
+    for ind in all_industries:
+        if ind not in industry_returns.columns:
+            industry_returns[ind] = np.nan
+        if ind not in industry_counts.columns:
+            industry_counts[ind] = np.nan
+    
+    # Reorder columns
+    industry_returns = industry_returns[all_industries]
+    industry_counts = industry_counts[all_industries]
     
     # Drop rows with all NaN (before data starts)
     industry_returns = industry_returns.dropna(how='all')
@@ -462,24 +587,6 @@ def load_fred_data(fred_path, start_date_str='1960-01-01'):
         merged_df = merged_df.ffill()
         
     return merged_df
-
-def load_economic_data(prep_path, series_list, start_date_str='1960-01-01'):
-    start_date = pd.Timestamp(start_date_str)
-    econ_dict = {}
-    for series in series_list:
-        file = os.path.join(prep_path, f'{series}_quarterly.csv')
-        if os.path.exists(file):
-            # FIX: Use 'observation_date' as index column (FRED format)
-            df_econ = pd.read_csv(file, index_col='observation_date', parse_dates=True)
-            # Filter economic data to start from start_date
-            df_econ = df_econ[df_econ.index >= start_date]
-            econ_dict[series] = df_econ[series]
-            print(f"✓ Loaded {series}: {len(df_econ)} observations (from {df_econ.index.min().date()})")
-        else:
-            print(f"✗ Missing: {series}")
-            
-    print(f"\nLoaded {len(econ_dict)}/{len(series_list)} economic series (all from {start_date.year}+)")
-    return econ_dict
 
 def load_risk_free_rate(prep_path, target_dates, start_date_str='1960-01-01'):
     start_date = pd.Timestamp(start_date_str)

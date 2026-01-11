@@ -1,7 +1,7 @@
 {
   "hmm": {
     "n_components": 2,
-    "min_train": 60,
+    "min_train": 120,
     "refit_freq": 12
   },
   "features": [
@@ -15,24 +15,29 @@
     "m2_growth",
     "unrate_trend",
     "valuation_spread_z",
-    "rsi",
     "hrp_mom_1m_z",
     "hrp_mom_3m_z",
     "hrp_mom_12m_z"
   ],
-  "tx_cost_bps": 10,
+  "tx_costs": {
+    "model": "two-stage",
+    "inner_cost_bps": 10,
+    "outer_cost_bps": 10,
+    "leverage_cost_bps": 10,
+    "financing_spread_bps": 50
+  },
   "prediction_metrics": {
-    "accuracy": 0.6622807017543859,
-    "roc_auc": 0.7645109953703704,
-    "precision_bear": 0.35353535353535354,
-    "precision_bull": 0.8992248062015504,
-    "recall_bear": 0.7291666666666666,
-    "recall_bull": 0.6444444444444445,
-    "f1_bear": 0.47619047619047616,
-    "f1_bull": 0.7508090614886731
+    "accuracy": 0.7648401826484018,
+    "roc_auc": 0.8059866962305987,
+    "precision_bear": 0.5309734513274337,
+    "precision_bull": 0.8461538461538461,
+    "recall_bear": 0.5454545454545454,
+    "recall_bull": 0.8384146341463414,
+    "f1_bear": 0.5381165919282511,
+    "f1_bull": 0.8422664624808576
   },
   "date_range": {
-    "start": "1986-11-30",
+    "start": "1988-05-31",
     "end": "2024-10-31"
   }
 }

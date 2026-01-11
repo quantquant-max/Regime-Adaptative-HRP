@@ -5,14 +5,6 @@ import os
 import scipy.cluster.hierarchy as sch
 from scipy.spatial.distance import squareform
 from scipy import stats
-from sklearn.covariance import LedoitWolf
-try:
-    from cov_shrinkage import compute_rmt
-except ImportError:
-    # Fallback if running as script
-    import sys
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    from cov_shrinkage import compute_rmt
 
 
 def print_distribution_comparison(strategy_returns, benchmark_returns, 
@@ -95,38 +87,81 @@ def print_distribution_comparison(strategy_returns, benchmark_returns,
     
     return {strategy_name: strat_stats, benchmark_name: bench_stats}
 
-def compute_sharpe(returns, rf_rates):
+
+def print_sharpe_comparison(strategy_returns: pd.Series, benchmark_returns: pd.Series, 
+                            rf_rate: pd.Series, strategy_name: str = 'HRP Strategy',
+                            benchmark_name: str = 'CRSP VW Index') -> dict:
     """
-    Compute QUARTERLY Sharpe ratio from MONTHLY returns
-    Methodology:
-    SR = (Cumulative 3-month Return - Cumulative 3-month RF) / 3-month Std
+    Print Sharpe ratio comparison between strategy and benchmark.
+    
+    Parameters
+    ----------
+    strategy_returns : pd.Series
+        Strategy monthly returns
+    benchmark_returns : pd.Series
+        Benchmark monthly returns
+    rf_rate : pd.Series
+        Monthly risk-free rate
+    strategy_name : str
+        Display name for strategy
+    benchmark_name : str
+        Display name for benchmark
+        
+    Returns
+    -------
+    dict
+        Dictionary with comparison metrics
     """
-    if returns.std() == 0 or len(returns) < 2:
-        return np.nan
+    print("\n" + "="*70)
+    print("SHARPE RATIO COMPARISON")
+    print("="*70)
     
-    # Cumulative return over the period
-    cumulative_return = (1 + returns).prod() - 1
+    # Align dates for fair comparison
+    common_dates = strategy_returns.index.intersection(benchmark_returns.index).intersection(rf_rate.index)
+    strat_aligned = strategy_returns.loc[common_dates]
+    bench_aligned = benchmark_returns.loc[common_dates]
+    rf_aligned = rf_rate.loc[common_dates]
     
-    # Cumulative RF over the period - ensure exact alignment
-    rf_aligned = rf_rates.reindex(returns.index, method='ffill')
-    # Check for any NaN values in RF
-    if rf_aligned.isna().any():
-        # Fill with 0 if RF data is missing (conservative assumption)
-        rf_aligned = rf_aligned.fillna(0)
-    cumulative_rf = (1 + rf_aligned).prod() - 1
+    # Compute excess returns
+    strat_excess = strat_aligned - rf_aligned
+    bench_excess = bench_aligned - rf_aligned
     
-    # Standard deviation over the period
-    std_period = returns.std()
+    # Annualized Sharpe Ratio = (mean excess return × 12) / (std × sqrt(12))
+    strat_sharpe = (strat_excess.mean() * 12) / (strat_excess.std() * np.sqrt(12))
+    bench_sharpe = (bench_excess.mean() * 12) / (bench_excess.std() * np.sqrt(12))
     
-    # Quarterly Sharpe
-    return (cumulative_return - cumulative_rf) / std_period
+    # Additional metrics
+    strat_ann_ret = strat_aligned.mean() * 12
+    strat_ann_vol = strat_aligned.std() * np.sqrt(12)
+    bench_ann_ret = bench_aligned.mean() * 12
+    bench_ann_vol = bench_aligned.std() * np.sqrt(12)
+    rf_ann = rf_aligned.mean() * 12
+    
+    print(f"\nPeriod: {common_dates.min().strftime('%Y-%m')} to {common_dates.max().strftime('%Y-%m')} ({len(common_dates)} months)")
+    print(f"Risk-Free Rate (annualized): {rf_ann:.2%}")
+    
+    print(f"\n{'Metric':<25} {strategy_name:>15} {benchmark_name:>15}")
+    print("-"*57)
+    print(f"{'Annualized Return':<25} {strat_ann_ret:>15.2%} {bench_ann_ret:>15.2%}")
+    print(f"{'Annualized Volatility':<25} {strat_ann_vol:>15.2%} {bench_ann_vol:>15.2%}")
+    print(f"{'Sharpe Ratio':<25} {strat_sharpe:>15.2f} {bench_sharpe:>15.2f}")
+    diff_label = f"({strategy_name[:3]} - {benchmark_name[:4]})"
+    print(f"{'Sharpe Difference':<25} {strat_sharpe - bench_sharpe:>+15.2f} {diff_label:>15}")
+    
+    return {
+        'period': (common_dates.min(), common_dates.max()),
+        'n_months': len(common_dates),
+        strategy_name: {'ann_return': strat_ann_ret, 'ann_vol': strat_ann_vol, 'sharpe': strat_sharpe},
+        benchmark_name: {'ann_return': bench_ann_ret, 'ann_vol': bench_ann_vol, 'sharpe': bench_sharpe},
+        'sharpe_diff': strat_sharpe - bench_sharpe
+    }
+
 
 def compute_metrics(returns, rf_monthly_aligned, name):
     """
-    Compute comprehensive performance metrics from MONTHLY returns
-    Uses QUARTERLY Sharpe methodology:
-    - SR = (Cumulative Return - Cumulative RF) / Std
-    - Computed over rolling 3-month windows, then averaged
+    Compute comprehensive performance metrics from MONTHLY returns.
+    Uses Standard Annualized Sharpe Ratio:
+    - SR = (Mean Monthly Excess Return / Std Monthly Excess Return) * sqrt(12)
     """
     cum = (1 + returns).cumprod()
     
@@ -158,14 +193,20 @@ def compute_metrics(returns, rf_monthly_aligned, name):
     
     annualized_std = returns.std() * np.sqrt(12)
     
+    # Max Drawdown: peak-to-trough decline at each point, take the worst
+    # Correct formula: (cum / running_max) - 1, then take min (most negative)
+    rolling_max = cum.expanding().max()
+    drawdowns = cum / rolling_max - 1
+    max_dd = -drawdowns.min()  # Convert to positive value
+    
     metrics = {
         'Strategy': name,
         'Total Excess Return': total_excess_return,
         'Annualized Excess Return': annualized_excess_return,
         'Sharpe Ratio': sharpe,
         'Volatility (Ann.)': annualized_std,
-        'Max Drawdown': (cum.cummax() - cum).max() / cum.cummax().max(),
-        'Calmar Ratio': annualized_return / ((cum.cummax() - cum).max() / cum.cummax().max()) if (cum.cummax() - cum).max() > 0 else 0,
+        'Max Drawdown': max_dd,
+        'Calmar Ratio': annualized_return / max_dd if max_dd > 0 else 0,
         'Win Rate': (returns > 0).sum() / len(returns),
         'Avg Win': returns[returns > 0].mean() if (returns > 0).any() else 0,
         'Avg Loss': returns[returns < 0].mean() if (returns < 0).any() else 0,
@@ -178,7 +219,7 @@ def compute_metrics(returns, rf_monthly_aligned, name):
 def check_identity_risk(weights, threshold=None):
     """
     Check if weights are dangerously close to Equal Weights,
-    indicating that the covariance shrinkage might have saturated (Identity Matrix).
+    which could indicate numerical issues with the covariance matrix.
     
     Args:
         weights (pd.Series): Portfolio weights.
@@ -205,12 +246,13 @@ def check_identity_risk(weights, threshold=None):
     
     return {'is_identity': is_identity, 'mad_ew': mad_ew}
 
-def plot_shrunk_covariance_matrices(returns_all, valid_rebal_dates, universe_flags, windows=[60], num_dates=3):
+def plot_covariance_matrices(returns_all, valid_rebal_dates, universe_flags, windows=[60], num_dates=3):
     """
-    Visualize Empirical vs Shrunk Covariance Matrices for a few sample dates.
+    Visualize Sample Covariance and Correlation Matrices for a few sample dates.
+    Note: Using pure sample covariance since N=12 industries < T=60 months.
     """
     print(f"\n{'='*70}")
-    print(f"VISUALIZATION: Covariance Shrinkage Analysis")
+    print(f"VISUALIZATION: Covariance Matrix Analysis")
     print(f"{'='*70}")
 
     # Select sample dates (beginning, middle, end)
@@ -242,44 +284,24 @@ def plot_shrunk_covariance_matrices(returns_all, valid_rebal_dates, universe_fla
         # Get returns for the max window
         window_returns = returns_all.loc[max_window_start:date][valid_universe]
         
-        # Compute Empirical Covariance
-        emp_cov = window_returns.cov()
-        
-        # Compute Shrunk Covariance (RMT Denoising)
-        try:
-            shrunk_cov = compute_rmt(window_returns.values)
-            method_name = "RMT Denoising"
-        except Exception as e:
-            print(f"RMT failed ({e}), falling back to Linear Ledoit-Wolf")
-            lw = LedoitWolf()
-            shrunk_cov = lw.fit(window_returns).covariance_
-            method_name = f"Linear Shrinkage (LW: {lw.shrinkage_:.4f})"
+        # Compute Sample Covariance
+        sample_cov = window_returns.cov()
         
         # Plot
-        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
         
-        # Empirical
-        im0 = axes[0].imshow(emp_cov, cmap='viridis', interpolation='none', vmin=-0.02, vmax=0.02)
-        axes[0].set_title(f"Empirical Covariance\n{date.date()} (N={len(valid_universe)})")
+        # Sample Covariance
+        im0 = axes[0].imshow(sample_cov, cmap='viridis', interpolation='none', vmin=-0.02, vmax=0.02)
+        axes[0].set_title(f"Sample Covariance\n{date.date()} (N={len(valid_universe)})", fontsize=11)
         fig.colorbar(im0, ax=axes[0])
         
-        # Shrunk
-        im1 = axes[1].imshow(shrunk_cov, cmap='viridis', interpolation='none', vmin=-0.02, vmax=0.02)
-        axes[1].set_title(f"{method_name}")
+        # Correlation Matrix
+        corr = window_returns.corr()
+        im1 = axes[1].imshow(corr, cmap='RdBu_r', interpolation='none', vmin=-1, vmax=1)
+        axes[1].set_title(f"Correlation Matrix", fontsize=11)
         fig.colorbar(im1, ax=axes[1])
         
-        # Difference
-        # Force numpy arrays to avoid DataFrame/Series ambiguity
-        shrunk_cov_np = np.array(shrunk_cov)
-        emp_cov_np = np.array(emp_cov)
-        diff = shrunk_cov_np - emp_cov_np
-        
-        # Use symmetric scale for difference
-        max_diff = max(abs(np.min(diff)), abs(np.max(diff)))
-        im2 = axes[2].imshow(diff, cmap='coolwarm', interpolation='none', vmin=-max_diff, vmax=max_diff)
-        axes[2].set_title("Difference (Shrunk - Empirical)")
-        fig.colorbar(im2, ax=axes[2])
-        
+        plt.suptitle(f"Covariance Analysis: N={len(valid_universe)} industries, T={len(window_returns)} months", fontsize=12, fontweight='bold')
         plt.tight_layout()
         plt.show()
 
@@ -362,96 +384,8 @@ def plot_portfolio_size(weights_df, output_dir):
     return portfolio_counts
 
 
-def plot_hrp_dendrogram(returns_all, universe_flags, date, window, output_dir):
-    """
-    Plots the HRP dendrogram (clustering tree) for a specific date and window.
-    Replicates the HRP clustering logic (Correlation -> Distance -> Ward Linkage).
-    """
-    print(f"\n{'='*70}")
-    print(f"PLOTTING DENDROGRAM: {date.date()} (Window: {window}m)")
-    print(f"{'='*70}")
-    
-    # 1. Filter Data
-    if date not in returns_all.index:
-        # Find closest previous date
-        available_dates = returns_all.index[returns_all.index <= date]
-        if len(available_dates) == 0:
-            print(f"No data available before {date}")
-            return
-        date = available_dates[-1]
-        print(f"Date {date} not found, using closest: {date.date()}")
-
-    # Get universe for this date/window
-    if window not in universe_flags.columns and isinstance(universe_flags, pd.DataFrame):
-        # If universe_flags is just the raw dataframe (Dates x Stocks)
-        valid_universe = universe_flags.loc[date]
-        valid_universe = valid_universe[valid_universe == 1].index.tolist()
-    elif isinstance(universe_flags, dict) and window in universe_flags:
-        # If it's the dictionary format
-        valid_universe = universe_flags[window].loc[date]
-        valid_universe = valid_universe[valid_universe == 1].index.tolist()
-    else:
-        # Fallback: use all stocks with valid data
-        valid_universe = returns_all.columns.tolist()
-
-    # Get returns window
-    end_idx = returns_all.index.get_loc(date)
-    start_idx = max(0, end_idx - window + 1)
-    window_returns = returns_all.iloc[start_idx : end_idx+1][valid_universe]
-    
-    # Filter valid stocks (non-zero variance)
-    window_returns = window_returns.loc[:, window_returns.var() > 1e-8]
-    
-    # Drop any columns with NaNs (Ledoit-Wolf cannot handle NaNs)
-    window_returns = window_returns.dropna(axis=1)
-    
-    valid_assets = window_returns.columns.tolist()
-    
-    print(f"Universe Size: {len(valid_assets)} stocks")
-    
-    if len(valid_assets) < 2:
-        print("Insufficient stocks to plot dendrogram.")
-        return
-
-    # 2. Compute Covariance & Correlation (Ledoit-Wolf)
-    lw = LedoitWolf()
-    lw.fit(window_returns)
-    cov = lw.covariance_
-    
-    std = np.sqrt(np.diag(cov))
-    corr = cov / np.outer(std, std)
-    corr = np.clip(corr, -1.0, 1.0)
-    
-    # 3. Compute Distance
-    dist = np.sqrt(np.clip((1 - corr) / 2.0, 0.0, None))
-    
-    # Euclidean distance on distance matrix
-    squared_norms = np.sum(dist ** 2, axis=1, keepdims=True)
-    eucl_dist = np.sqrt(np.clip(squared_norms + squared_norms.T - 2 * np.dot(dist, dist.T), 0.0, None))
-    eucl_dist_condensed = squareform(eucl_dist, checks=False)
-    
-    # 4. Clustering (Ward Linkage)
-    link = sch.linkage(eucl_dist_condensed, method='ward')
-    
-    # 5. Plot
-    plt.figure(figsize=(15, 8))
-    sch.dendrogram(
-        link,
-        labels=valid_assets,
-        leaf_rotation=90.,
-        leaf_font_size=8.,
-        no_plot=False,
-        truncate_mode='lastp',  # Show only last p merged clusters
-        p=50,                   # Show top 50 clusters to keep it readable
-        show_contracted=True
-    )
-    plt.title(f'HRP Dendrogram (Ward Linkage)\nDate: {date.date()} | Window: {window}m | Stocks: {len(valid_assets)}')
-    plt.xlabel('Stocks / Clusters')
-    plt.ylabel('Distance')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'dendrogram_{date.date()}_{window}m.png'))
-    plt.show()
+# NOTE: plot_hrp_dendrogram (legacy ~600 stock dendrogram) removed
+# Use plot_industry_dendrogram for 12-industry visualization
 
 
 # Fama-French 12 Industry Names
@@ -564,6 +498,10 @@ def plot_weight_distribution(hrp_weights_df, permno_to_ff12, output_dir,
         ax2.grid(axis='x', alpha=0.3)
         ax2.invert_yaxis()
         
+        # Set x-axis limit to accommodate all bars with space for labels
+        max_ind_w = max(ind_w) if ind_w else 10
+        ax2.set_xlim(0, max(max_ind_w * 1.25, 15))  # At least 15% or 25% more than max
+        
         # Add percentage labels on bars
         for j, (bar, w) in enumerate(zip(bars2, ind_w)):
             if w > 2:
@@ -672,168 +610,13 @@ def plot_industry_exposure_over_time(hrp_weights_df, permno_to_ff12, output_dir)
     return industry_df
 
 
-def plot_rmt_comparison(returns_all, universe_flags, target_date, window, save_path, 
-                        denoise_func=None):
-    """
-    Plot correlation matrix before and after RMT denoising side-by-side.
-    Uses quasi-diagonalization (seriation) for better visualization.
-    
-    Args:
-        returns_all: DataFrame of all stock returns (date x PERMNO)
-        universe_flags: DataFrame of boolean flags for universe membership
-        target_date: str or Timestamp for the rebalancing date
-        window: int, lookback window in months
-        save_path: str, path to save the output figure
-        denoise_func: callable, RMT denoising function (default: hrp_functions.denoise_covariance_rmt)
-        
-    Returns:
-        tuple: (corr_raw, corr_denoised) numpy arrays
-    """
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    
-    # Import denoising function if not provided
-    if denoise_func is None:
-        try:
-            from cov_shrinkage import compute_rmt
-            denoise_func = compute_rmt
-        except ImportError:
-            raise ImportError("cov_shrinkage module required for RMT denoising")
-    
-    # Get stocks in universe at target date
-    target_date = pd.Timestamp(target_date)
-    if target_date not in universe_flags.index:
-        # Find closest date
-        closest_idx = universe_flags.index.get_indexer([target_date], method='nearest')[0]
-        target_date = universe_flags.index[closest_idx]
-        print(f"  (Date adjusted to nearest: {target_date.strftime('%Y-%m-%d')})")
-    
-    in_universe = universe_flags.loc[target_date]
-    valid_permnos = in_universe[in_universe == True].index.tolist()
-    
-    if len(valid_permnos) == 0:
-        raise ValueError(f"No stocks in universe for date {target_date.strftime('%Y-%m')}. "
-                        f"Check if universe_flags covers this date range.")
-    
-    # Get lookback returns
-    start_date = target_date - pd.DateOffset(months=window)
-    mask = (returns_all.index >= start_date) & (returns_all.index <= target_date)
-    returns_window = returns_all.loc[mask, valid_permnos].dropna(axis=1, how='any')
-    
-    print(f"Date: {target_date.strftime('%Y-%m')}, Universe: {len(valid_permnos)}, "
-          f"Before filter: {returns_window.shape[1]} stocks, {returns_window.shape[0]} months")
-    
-    # Require at least `window` months of data (use >= to handle slight date variations)
-    returns_window = returns_window.loc[:, returns_window.count() >= window]
-    
-    # Validate we have enough data
-    if returns_window.shape[1] < 2:
-        raise ValueError(f"Insufficient stocks ({returns_window.shape[1]}) for date {target_date.strftime('%Y-%m')}. "
-                        f"Need at least 2 stocks with {window} months of returns.")
-    
-    print(f"  After filter: {returns_window.shape[1]} stocks with {window}+ months")
-    
-    # Compute raw correlation matrix
-    corr_raw = returns_window.corr().values
-    
-    # Compute eigenvalues of raw correlation to show MP threshold info
-    T, N = returns_window.shape
-    eVal_raw = np.linalg.eigvalsh(corr_raw)[::-1]  # Sorted descending
-    q = N / T  # Aspect ratio
-    sigma_sq = 1.0  # Theoretical variance for standardized data
-    lambda_max = sigma_sq * (1 + np.sqrt(q))**2
-    n_signal = int(np.sum(eVal_raw > lambda_max))
-    effective_rank = min(T - 1, N)
-    print(f"  MP threshold: λ_max={lambda_max:.3f} (q=N/T={q:.2f}), Signal: {n_signal}/{effective_rank} non-zero eigenvalues")
-    
-    # Apply RMT denoising (returns covariance matrix)
-    cov_denoised = denoise_func(returns_window.values)
-    
-    # Convert denoised covariance to correlation
-    std_denoised = np.sqrt(np.diag(cov_denoised))
-    std_denoised = np.maximum(std_denoised, 1e-10)  # Avoid division by zero
-    corr_denoised = cov_denoised / np.outer(std_denoised, std_denoised)
-    np.fill_diagonal(corr_denoised, 1.0)  # Ensure diagonal is exactly 1
-    
-    # Quasi-diagonalize for better visualization (reorder by hierarchical clustering)
-    # Use correlation distance for clustering
-    dist = np.sqrt(0.5 * (1 - corr_denoised))
-    np.fill_diagonal(dist, 0)
-    
-    # Hierarchical clustering
-    condensed_dist = dist[np.triu_indices(len(dist), k=1)]
-    Z = linkage(condensed_dist, method='ward')
-    order = leaves_list(Z)
-    
-    # Reorder both matrices
-    corr_raw_ordered = corr_raw[np.ix_(order, order)]
-    corr_denoised_ordered = corr_denoised[np.ix_(order, order)]
-    
-    # Compute difference matrix (Raw - Denoised)
-    corr_diff_ordered = corr_raw_ordered - corr_denoised_ordered
-    
-    # Create figure with 3 panels: Raw, Denoised, Difference
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # Common colorbar settings for correlation matrices
-    vmin, vmax = -0.5, 1.0
-    cmap = 'RdBu_r'
-    
-    # Raw correlation matrix
-    im1 = axes[0].imshow(corr_raw_ordered, cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-    axes[0].set_title(f'Raw Correlation\n{target_date.strftime("%Y-%m")} (N={len(order)})', fontsize=11)
-    axes[0].set_xlabel('Asset (quasi-diagonalized)')
-    axes[0].set_ylabel('Asset (quasi-diagonalized)')
-    axes[0].set_xticks([])
-    axes[0].set_yticks([])
-    cbar1 = fig.colorbar(im1, ax=axes[0], orientation='vertical', fraction=0.046, pad=0.04)
-    cbar1.set_label('ρ', fontsize=10)
-    
-    # Denoised correlation matrix
-    im2 = axes[1].imshow(corr_denoised_ordered, cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-    axes[1].set_title(f'RMT Denoised Correlation\n{target_date.strftime("%Y-%m")} (N={len(order)})', fontsize=11)
-    axes[1].set_xlabel('Asset (quasi-diagonalized)')
-    axes[1].set_ylabel('Asset (quasi-diagonalized)')
-    axes[1].set_xticks([])
-    axes[1].set_yticks([])
-    cbar2 = fig.colorbar(im2, ax=axes[1], orientation='vertical', fraction=0.046, pad=0.04)
-    cbar2.set_label('ρ', fontsize=10)
-    
-    # Difference matrix with ADAPTIVE scale (centered at 0)
-    diff_off_diag = corr_diff_ordered[np.triu_indices(len(corr_diff_ordered), k=1)]
-    diff_max = max(abs(diff_off_diag.min()), abs(diff_off_diag.max()))
-    diff_max = max(diff_max, 0.01)  # Ensure minimum scale
-    
-    im3 = axes[2].imshow(corr_diff_ordered, cmap='RdBu_r', vmin=-diff_max, vmax=diff_max, aspect='auto')
-    axes[2].set_title(f'Difference (Raw − Denoised)\nAdaptive Scale ±{diff_max:.3f}', fontsize=11)
-    axes[2].set_xlabel('Asset (quasi-diagonalized)')
-    axes[2].set_ylabel('Asset (quasi-diagonalized)')
-    axes[2].set_xticks([])
-    axes[2].set_yticks([])
-    cbar3 = fig.colorbar(im3, ax=axes[2], orientation='vertical', fraction=0.046, pad=0.04)
-    cbar3.set_label('Δρ', fontsize=10)
-    
-    # Add statistics annotation
-    raw_off_diag = corr_raw[np.triu_indices(len(corr_raw), k=1)]
-    denoised_off_diag = corr_denoised[np.triu_indices(len(corr_denoised), k=1)]
-    
-    stats_text = (
-        f"Raw: mean={raw_off_diag.mean():.3f}, std={raw_off_diag.std():.3f}  |  "
-        f"Denoised: mean={denoised_off_diag.mean():.3f}, std={denoised_off_diag.std():.3f}  |  "
-        f"Diff: mean={diff_off_diag.mean():.4f}, std={diff_off_diag.std():.4f}"
-    )
-    fig.text(0.5, 0.02, stats_text, ha='center', fontsize=9, family='monospace',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout(rect=[0, 0.06, 1.0, 1])
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    
-    return corr_raw, corr_denoised
+# NOTE: plot_rmt_comparison removed - RMT is applied internally in HRP computation
+# For industry ETF approach (N=12 < T=60), RMT visualization is less relevant
 
 
 def plot_industry_hrp_weights(industry_weights_path, output_dir):
     """
-    Plot HRP industry weights over time (stacked area chart + heatmap).
+    Plot HRP industry weights over time (stacked area chart).
     
     Args:
         industry_weights_path: Path to hrp_industry_weights.csv
@@ -842,51 +625,19 @@ def plot_industry_hrp_weights(industry_weights_path, output_dir):
     # Load industry weights
     df = pd.read_csv(industry_weights_path, index_col=0, parse_dates=True)
     
-    # Define colors for industries
+    # Define colors for industries (use tab20 for 12 distinct colors)
     colors = plt.cm.tab20(np.linspace(0, 1, len(df.columns)))
     
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(14, 6))
     
-    # =========================================================================
-    # Plot 1: Stacked Area Chart
-    # =========================================================================
-    ax1 = axes[0]
-    ax1.stackplot(df.index, df.T.values, labels=df.columns, colors=colors, alpha=0.8)
-    ax1.set_ylabel('Weight')
-    ax1.set_xlabel('Date')
-    ax1.set_title('HRP Industry Weights Over Time (Stacked Area)', fontsize=12, fontweight='bold')
-    ax1.set_ylim(0, 1)
-    ax1.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
-    ax1.grid(True, alpha=0.3)
-    
-    # =========================================================================
-    # Plot 2: Heatmap
-    # =========================================================================
-    ax2 = axes[1]
-    
-    # Resample to quarterly for readability if too many dates
-    if len(df) > 100:
-        df_plot = df.resample('QE').mean()
-        title_suffix = "(Quarterly Average)"
-    else:
-        df_plot = df
-        title_suffix = "(Monthly)"
-    
-    im = ax2.imshow(df_plot.T.values, aspect='auto', cmap='YlOrRd', vmin=0, vmax=df_plot.max().max())
-    ax2.set_yticks(range(len(df_plot.columns)))
-    ax2.set_yticklabels(df_plot.columns)
-    ax2.set_xlabel('Date')
-    ax2.set_ylabel('Industry')
-    ax2.set_title(f'HRP Industry Weights Heatmap {title_suffix}', fontsize=12, fontweight='bold')
-    
-    # Set x-axis ticks (show every Nth date)
-    n_ticks = 10
-    tick_positions = np.linspace(0, len(df_plot)-1, n_ticks, dtype=int)
-    ax2.set_xticks(tick_positions)
-    ax2.set_xticklabels([df_plot.index[i].strftime('%Y-%m') for i in tick_positions], rotation=45, ha='right')
-    
-    cbar = fig.colorbar(im, ax=ax2, orientation='vertical', fraction=0.02, pad=0.02)
-    cbar.set_label('Weight')
+    # Stacked Area Chart
+    ax.stackplot(df.index, df.T.values, labels=df.columns, colors=colors, alpha=0.8)
+    ax.set_ylabel('Weight')
+    ax.set_xlabel('Date')
+    ax.set_title('HRP Industry Weights Over Time', fontsize=12, fontweight='bold')
+    ax.set_ylim(0, 1)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'hrp_industry_weights_over_time.png'), dpi=150, bbox_inches='tight')
@@ -916,7 +667,6 @@ def plot_industry_dendrogram(industry_returns, date, window, output_dir):
     """
     from scipy.cluster.hierarchy import linkage, dendrogram
     from scipy.spatial.distance import squareform
-    from sklearn.covariance import LedoitWolf
     
     # Get window data
     window_start = date - pd.DateOffset(months=window)
@@ -959,5 +709,70 @@ def plot_industry_dendrogram(industry_returns, date, window, output_dir):
     plt.show()
     
     return dendro
-    print(f"✓ Saved: {save_path}")
-    return corr_raw, corr_denoised
+
+def analyze_subsample_performance(strategy_results, strategy_results_net, rf_monthly_aligned, n_periods=3):
+    """
+    Analyze consistency of Sharpe Ratio across equal time periods.
+    
+    Args:
+        strategy_results: DataFrame with gross results
+        strategy_results_net: DataFrame with net results
+        rf_monthly_aligned: Series with risk-free rate
+        n_periods: Number of sub-samples to split into
+        
+    Returns:
+        tuple: (results_df, df_analysis, periods)
+    """
+    # Combine Gross and Net returns
+    df_analysis = pd.DataFrame({
+        'HRP (Gross)': strategy_results['hrp_return'],
+        'Scaled (Gross)': strategy_results['regime_prob_scaled_return'],
+        'HRP (Net)': strategy_results_net['hrp_return_net'],
+        'Scaled (Net)': strategy_results_net['regime_prob_scaled_return_net']
+    })
+
+    # Align Risk Free Rate
+    rf_subset = rf_monthly_aligned.reindex(df_analysis.index).fillna(0.0)
+
+    # Define equal periods
+    n_months = len(df_analysis)
+    idx = df_analysis.index
+    
+    # Calculate split points
+    split_size = n_months // n_periods
+    
+    periods = []
+    current_idx = 0
+    for i in range(n_periods):
+        start_pos = current_idx
+        # For the last period, take everything remaining
+        end_pos = n_months - 1 if i == n_periods - 1 else current_idx + split_size - 1
+        
+        periods.append((idx[start_pos], idx[end_pos]))
+        current_idx = end_pos + 1
+
+    results = []
+
+    for i, (start, end) in enumerate(periods):
+        # Select data for period
+        mask = (df_analysis.index >= start) & (df_analysis.index <= end)
+        sub_df = df_analysis.loc[mask]
+        sub_rf = rf_subset.loc[mask]
+        
+        # Calculate Sharpe for all columns
+        row = {'Period': f"Sub-Sample {i+1}\n({start:%Y-%m} to {end:%Y-%m})"}
+        
+        for col in df_analysis.columns:
+            excess_ret = sub_df[col] - sub_rf
+            if excess_ret.std() > 0:
+                sharpe = (excess_ret.mean() / excess_ret.std()) * np.sqrt(12)
+            else:
+                sharpe = 0.0
+            row[col] = sharpe
+        
+        results.append(row)
+
+    # Create DataFrame
+    results_df = pd.DataFrame(results).set_index('Period')
+    
+    return results_df, df_analysis, periods

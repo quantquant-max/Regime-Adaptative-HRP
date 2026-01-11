@@ -25,14 +25,14 @@ paths:
 
 # HMM Regime Detection
 hmm:
-  min_train: 60          # Minimum months before first HMM fit
+  min_train: 120         # Minimum months before first HMM fit (20 years)
   refit_freq: 12         # Refit every N months
   n_components: 2        # Number of regimes (Bear/Bull)
   downside_window: 6     # Window for downside deviation
 
 # XGBoost ML Configuration - Bear/Bull Regime Prediction
 ml:
-  min_train_months: 120  # Minimum training data before predictions
+  min_train_months: 120   # Minimum training data before predictions (5 years)
   refit_frequency: 12    # Refit model every N months
   optuna_trials: 50      # Number of Optuna hyperparameter trials (initial, if not tuning in WF)
   optuna_trials_per_refit: 20  # Optuna trials per refit inside walk-forward
@@ -40,8 +40,18 @@ ml:
   purge_gap: 12          # Months to purge between train/test (match vol lookback)
   embargo_pct: 0.01      # Embargo period as % of test size
   importance_threshold: 0.0  # Feature selection threshold
-  select_features_in_wf: true  # Feature selection inside walk-forward
-  tune_hyperparams_in_wf: true  # Hyperparameter tuning inside walk-forward
+  select_features_in_wf: false  # Feature selection inside walk-forward
+  tune_hyperparams_in_wf: false  # Hyperparameter tuning inside walk-forward
+  
+  # Fixed XGBoost Parameters (used when tune_hyperparams_in_wf is false)
+  fixed_params:
+    max_depth: 3           
+    learning_rate: 0.05    
+    subsample: 0.8         
+    colsample_bytree: 0.8  
+    reg_alpha: 2.0         # L1 reg
+    reg_lambda: 5.0        # L2 reg
+    n_estimators: 500      
 
 # Strategy Parameters
 strategy:
@@ -51,4 +61,4 @@ strategy:
 
 # Computation Options
 computation:
-  recompute_weights: true  # Set to true to recompute with new two-stage HRP
+  recompute_weights: False  # Set to true to recompute with new two-stage HRP

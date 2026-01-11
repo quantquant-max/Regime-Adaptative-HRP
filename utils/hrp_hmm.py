@@ -36,6 +36,27 @@ except ImportError:
 
 logger = setup_logger()
 
+# =============================================================================
+# GPU Detection for CuPy
+# =============================================================================
+GPU_AVAILABLE = False
+cp = None
+
+def _detect_gpu():
+    """Detect if CuPy is available for GPU acceleration."""
+    global GPU_AVAILABLE, cp
+    try:
+        import cupy as _cp
+        _cp.array([1, 2, 3])  # Test GPU
+        cp = _cp
+        GPU_AVAILABLE = True
+        logger.info("✓ hrp_hmm: CuPy GPU available")
+    except Exception:
+        GPU_AVAILABLE = False
+        logger.info("✗ hrp_hmm: CuPy not available, using CPU")
+
+_detect_gpu()
+
 
 def _compute_log_likelihood(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
     """
@@ -84,7 +105,7 @@ def _compute_log_likelihood(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
     return log_prob
 
 
-def _forward_filter(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+def _forward_filter(model: GaussianHMM, X: np.ndarray, use_gpu: bool = None) -> np.ndarray:
     """
     Compute FILTERED probabilities using forward algorithm only.
     
@@ -103,12 +124,25 @@ def _forward_filter(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
         Fitted HMM model with startprob_, transmat_, means_, covars_
     X : np.ndarray, shape (n_samples, n_features)
         Observation sequence
+    use_gpu : bool, optional
+        If True, use GPU. If False, use CPU. If None, auto-detect.
         
     Returns
     -------
     np.ndarray, shape (n_samples, n_components)
         Filtered probabilities P(q_t | O_1:t) for each timestep
     """
+    if use_gpu is None:
+        use_gpu = GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        return _forward_filter_gpu(model, X)
+    else:
+        return _forward_filter_cpu(model, X)
+
+
+def _forward_filter_cpu(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+    """CPU implementation of forward filter."""
     n_samples = X.shape[0]
     n_components = model.n_components
     
@@ -143,6 +177,58 @@ def _forward_filter(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
     filtered_probs = filtered_probs / filtered_probs.sum(axis=1, keepdims=True)
     
     return filtered_probs
+
+
+def _forward_filter_gpu(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+    """
+    GPU-accelerated forward filter using CuPy.
+    
+    Vectorizes the inner loop over states using GPU matrix operations.
+    Note: The outer loop over time is sequential (inherent HMM dependency).
+    """
+    n_samples = X.shape[0]
+    n_components = model.n_components
+    
+    # Get log emission probabilities (computed on CPU via scipy)
+    log_frameprob_np = _compute_log_likelihood(model, X)
+    
+    # Transfer to GPU
+    log_frameprob = cp.asarray(log_frameprob_np)
+    log_startprob = cp.log(cp.asarray(model.startprob_) + 1e-10)
+    log_transmat = cp.log(cp.asarray(model.transmat_) + 1e-10)
+    
+    # Forward pass in log space
+    log_alpha = cp.zeros((n_samples, n_components), dtype=cp.float64)
+    
+    # Initialize
+    log_alpha[0] = log_startprob + log_frameprob[0]
+    
+    # Forward recursion - vectorized over states
+    # α_t(j) = P(O_t | q_t=j) * Σ_i [α_{t-1}(i) * A_{ij}]
+    # In log space: log_alpha[t, j] = log_frameprob[t, j] + logsumexp_i(log_alpha[t-1, i] + log_transmat[i, j])
+    for t in range(1, n_samples):
+        # Vectorized logsumexp: for each j, compute logsumexp over i
+        # log_alpha[t-1, :, None] + log_transmat has shape (n_components, n_components)
+        # where [i, j] = log_alpha[t-1, i] + log_transmat[i, j]
+        log_transition = log_alpha[t-1, :, cp.newaxis] + log_transmat  # (n_components, n_components)
+        
+        # logsumexp over axis=0 (sum over i) -> shape (n_components,)
+        max_log = cp.max(log_transition, axis=0)
+        log_sum = max_log + cp.log(cp.sum(cp.exp(log_transition - max_log), axis=0))
+        
+        log_alpha[t] = log_sum + log_frameprob[t]
+    
+    # Normalize to get filtered probabilities
+    max_alpha = cp.max(log_alpha, axis=1, keepdims=True)
+    log_sum_alpha = max_alpha + cp.log(cp.sum(cp.exp(log_alpha - max_alpha), axis=1, keepdims=True))
+    log_filtered = log_alpha - log_sum_alpha
+    
+    # Convert back to probability space
+    filtered_probs = cp.exp(log_filtered)
+    filtered_probs = filtered_probs / cp.sum(filtered_probs, axis=1, keepdims=True)
+    
+    # Transfer back to CPU
+    return cp.asnumpy(filtered_probs)
 
 
 def rolling_downside_deviation(returns: pd.Series, window: int = 12, 
@@ -372,6 +458,73 @@ def prepare_hmm_data(market_returns: pd.Series,
     logger.info(f"HMM features: {list(df_hmm.columns)}")
     
     return df_hmm_raw, df_hmm
+
+
+def check_hmm_data_quality(df_hmm: pd.DataFrame, verbose: bool = True) -> dict:
+    """
+    Check for missing values in HMM input features.
+    
+    Parameters
+    ----------
+    df_hmm : pd.DataFrame
+        Standardized HMM input features (log_return_z, downside_dev_z, sent_change_z)
+    verbose : bool
+        If True, print results to console
+        
+    Returns
+    -------
+    dict
+        Dictionary with check results:
+        - 'all_valid': bool - True if no missing values in any feature
+        - 'feature_status': dict - {feature_name: {'valid': bool, 'n_missing': int, 'missing_dates': list}}
+    """
+    hmm_feature_cols = ['log_return_z', 'downside_dev_z', 'sent_change_z']
+    
+    results = {
+        'all_valid': True,
+        'feature_status': {}
+    }
+    
+    if verbose:
+        print("-"*70)
+        print("DATA QUALITY CHECK: HMM Input Features")
+        print("-"*70)
+    
+    for col in hmm_feature_cols:
+        if col in df_hmm.columns:
+            missing_mask = df_hmm[col].isna()
+            n_missing = missing_mask.sum()
+            
+            if n_missing == 0:
+                results['feature_status'][col] = {
+                    'valid': True,
+                    'n_missing': 0,
+                    'missing_dates': []
+                }
+                if verbose:
+                    print(f"  ✓ {col}: No missing values ({len(df_hmm)} obs)")
+            else:
+                missing_dates = df_hmm.index[missing_mask].strftime('%Y-%m-%d').tolist()
+                results['feature_status'][col] = {
+                    'valid': False,
+                    'n_missing': n_missing,
+                    'missing_dates': missing_dates
+                }
+                results['all_valid'] = False
+                if verbose:
+                    print(f"  ✗ {col}: {n_missing} missing values")
+                    print(f"    Dates: {missing_dates[:10]}{'...' if n_missing > 10 else ''}")
+        else:
+            results['feature_status'][col] = {
+                'valid': False,
+                'n_missing': -1,
+                'missing_dates': []
+            }
+            results['all_valid'] = False
+            if verbose:
+                print(f"  ✗ {col}: Column not found in df_hmm!")
+    
+    return results
 
 
 def fit_expanding_hmm(df_hmm: pd.DataFrame, 

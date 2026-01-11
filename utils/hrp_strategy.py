@@ -2,7 +2,7 @@
 HRP Strategy Module - Strategy Execution and Performance Analysis
 ================================================================
 Provides functions for:
-- Transaction cost calculation
+- Transaction cost calculation (GPU-accelerated with CPU fallback)
 - Strategy return computation (Buy & Hold, Probability-weighted)
 - Prediction quality metrics
 """
@@ -12,6 +12,29 @@ import pandas as pd
 from hrp_logger import setup_logger
 
 logger = setup_logger()
+
+# =============================================================================
+# GPU Detection for CuPy
+# =============================================================================
+GPU_AVAILABLE = False
+cp = None
+
+def _detect_gpu():
+    """Detect if CuPy GPU is available."""
+    global GPU_AVAILABLE, cp
+    try:
+        import cupy as _cp
+        # Test GPU availability
+        _cp.array([1, 2, 3])
+        cp = _cp
+        GPU_AVAILABLE = True
+        logger.info("✓ hrp_strategy: CuPy GPU available")
+    except Exception as e:
+        GPU_AVAILABLE = False
+        cp = None
+        logger.info(f"[!] hrp_strategy: CuPy not available ({type(e).__name__}), using CPU")
+
+_detect_gpu()
 
 
 def calculate_turnover_naive(weights: pd.DataFrame) -> pd.Series:
@@ -41,9 +64,11 @@ def calculate_turnover_naive(weights: pd.DataFrame) -> pd.Series:
 
 def calculate_turnover_with_drift(weights: pd.DataFrame, 
                                    stock_returns: pd.DataFrame,
-                                   portfolio_returns: pd.Series) -> pd.Series:
+                                   portfolio_returns: pd.Series,
+                                   use_gpu: bool = None) -> pd.Series:
     """
     Calculate TRUE turnover accounting for price drift during the holding period.
+    GPU-accelerated with CPU fallback.
     
     Turnover_t = Σ|w_{i,t}^{Target} - w_{i,t}^{Drifted}|
     
@@ -60,12 +85,28 @@ def calculate_turnover_with_drift(weights: pd.DataFrame,
         Individual stock returns (dates × assets)
     portfolio_returns : pd.Series
         Portfolio-level returns (dates)
+    use_gpu : bool, optional
+        Force GPU (True) or CPU (False). If None, auto-detect.
         
     Returns
     -------
     pd.Series
         Monthly turnover accounting for drift
     """
+    # Determine GPU usage
+    if use_gpu is None:
+        use_gpu = GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        return _calculate_turnover_with_drift_gpu(weights, stock_returns, portfolio_returns)
+    else:
+        return _calculate_turnover_with_drift_cpu(weights, stock_returns, portfolio_returns)
+
+
+def _calculate_turnover_with_drift_cpu(weights: pd.DataFrame, 
+                                        stock_returns: pd.DataFrame,
+                                        portfolio_returns: pd.Series) -> pd.Series:
+    """CPU implementation of drift-adjusted turnover."""
     weights_filled = weights.fillna(0)
     turnover = pd.Series(index=weights.index, dtype=float)
     
@@ -107,6 +148,57 @@ def calculate_turnover_with_drift(weights: pd.DataFrame,
     return turnover
 
 
+def _calculate_turnover_with_drift_gpu(weights: pd.DataFrame, 
+                                        stock_returns: pd.DataFrame,
+                                        portfolio_returns: pd.Series) -> pd.Series:
+    """
+    GPU-accelerated implementation of drift-adjusted turnover.
+    Vectorizes the computation across all dates at once on GPU.
+    """
+    import cupy as cp
+    
+    # Align columns
+    common_cols = weights.columns.intersection(stock_returns.columns)
+    weights_aligned = weights[common_cols].fillna(0)
+    stock_returns_aligned = stock_returns.reindex(columns=common_cols, index=weights.index).fillna(0)
+    portfolio_returns_aligned = portfolio_returns.reindex(weights.index).fillna(0)
+    
+    # Convert to CuPy arrays
+    W = cp.asarray(weights_aligned.values, dtype=cp.float32)  # (T, N)
+    R = cp.asarray(stock_returns_aligned.values, dtype=cp.float32)  # (T, N)
+    Rp = cp.asarray(portfolio_returns_aligned.values, dtype=cp.float32)  # (T,)
+    
+    T, N = W.shape
+    turnover_gpu = cp.zeros(T, dtype=cp.float32)
+    
+    # First month: full investment
+    turnover_gpu[0] = cp.abs(W[0]).sum()
+    
+    # Vectorized computation for remaining months
+    # W_prev = W[:-1], W_new = W[1:]
+    # R_stocks = R[1:], Rp = Rp[1:]
+    W_prev = W[:-1]  # (T-1, N)
+    W_new = W[1:]    # (T-1, N)
+    R_stocks = R[1:]  # (T-1, N)
+    Rp_vec = Rp[1:]   # (T-1,)
+    
+    # Drifted weights: w_prev * (1 + r_stock) / (1 + r_portfolio)
+    # Expand Rp for broadcasting: (T-1,) -> (T-1, 1)
+    Rp_expanded = Rp_vec[:, cp.newaxis]
+    
+    # Avoid division by zero
+    denom = cp.where(cp.abs(1 + Rp_expanded) > 1e-8, 1 + Rp_expanded, 1.0)
+    W_drifted = W_prev * (1 + R_stocks) / denom
+    
+    # Turnover: sum of absolute differences
+    turnover_vec = cp.abs(W_new - W_drifted).sum(axis=1)
+    turnover_gpu[1:] = turnover_vec
+    
+    # Transfer back to CPU
+    turnover_np = cp.asnumpy(turnover_gpu)
+    return pd.Series(turnover_np, index=weights.index)
+
+
 # =============================================================================
 # TWO-STAGE TRANSACTION COST MODEL (Industry ETF Framework)
 # =============================================================================
@@ -114,9 +206,11 @@ def calculate_turnover_with_drift(weights: pd.DataFrame,
 def calculate_within_industry_turnover(within_industry_weights: dict,
                                        stock_returns: pd.DataFrame,
                                        industry_returns: pd.DataFrame,
-                                       dates: list) -> pd.DataFrame:
+                                       dates: list,
+                                       use_gpu: bool = None) -> pd.DataFrame:
     """
     Calculate drift-adjusted turnover WITHIN each industry (Stage 1 cost).
+    GPU-accelerated with CPU fallback.
     
     For each industry k:
         turnover_k,t = Σ_{i ∈ k} |w_i,t^target - w_i,t^drifted|
@@ -134,12 +228,33 @@ def calculate_within_industry_turnover(within_industry_weights: dict,
         Industry ETF returns (dates × industry names)
     dates : list
         Ordered list of dates to compute turnover for
+    use_gpu : bool, optional
+        Force GPU (True) or CPU (False). If None, auto-detect.
         
     Returns
     -------
     pd.DataFrame
         Within-industry turnover per industry (dates × industries)
     """
+    # Determine GPU usage
+    if use_gpu is None:
+        use_gpu = GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        return _calculate_within_industry_turnover_gpu(
+            within_industry_weights, stock_returns, industry_returns, dates
+        )
+    else:
+        return _calculate_within_industry_turnover_cpu(
+            within_industry_weights, stock_returns, industry_returns, dates
+        )
+
+
+def _calculate_within_industry_turnover_cpu(within_industry_weights: dict,
+                                            stock_returns: pd.DataFrame,
+                                            industry_returns: pd.DataFrame,
+                                            dates: list) -> pd.DataFrame:
+    """CPU implementation of within-industry turnover calculation."""
     from hrp_data import FF12_INDUSTRY_NAMES
     
     # Map industry names back to IDs
@@ -212,11 +327,125 @@ def calculate_within_industry_turnover(within_industry_weights: dict,
     return turnover_df
 
 
+def _calculate_within_industry_turnover_gpu(within_industry_weights: dict,
+                                            stock_returns: pd.DataFrame,
+                                            industry_returns: pd.DataFrame,
+                                            dates: list) -> pd.DataFrame:
+    """
+    GPU-accelerated implementation of within-industry turnover.
+    
+    Converts nested dict structure to dense arrays for GPU computation.
+    """
+    import cupy as cp
+    from hrp_data import FF12_INDUSTRY_NAMES
+    
+    # Map industry names back to IDs
+    name_to_id = {v: k for k, v in FF12_INDUSTRY_NAMES.items()}
+    id_to_name = FF12_INDUSTRY_NAMES
+    
+    # Get all unique PERMNOs across all dates and industries
+    all_permnos = set()
+    for date_weights in within_industry_weights.values():
+        for ind_weights in date_weights.values():
+            all_permnos.update(ind_weights.keys())
+    permno_list = sorted(all_permnos)
+    permno_to_idx = {p: i for i, p in enumerate(permno_list)}
+    
+    n_dates = len(dates)
+    n_permnos = len(permno_list)
+    n_industries = len(industry_returns.columns)
+    
+    # Initialize output
+    turnover_df = pd.DataFrame(index=dates, columns=industry_returns.columns, dtype=float)
+    
+    # Build industry membership mapping (permno -> industry_idx)
+    # This assumes each PERMNO belongs to only one industry
+    permno_to_industry = {}
+    for date in dates:
+        if date in within_industry_weights:
+            for ind_id, ind_weights in within_industry_weights[date].items():
+                for permno in ind_weights.keys():
+                    if permno not in permno_to_industry:
+                        permno_to_industry[permno] = ind_id
+    
+    # For each industry, process in batches
+    for ind_name in industry_returns.columns:
+        ind_id = name_to_id.get(ind_name)
+        if not ind_id:
+            continue
+        
+        # Collect PERMNOs for this industry
+        ind_permnos = [p for p, i in permno_to_industry.items() if i == ind_id]
+        if not ind_permnos:
+            continue
+        
+        ind_permno_to_idx = {p: i for i, p in enumerate(ind_permnos)}
+        n_ind_permnos = len(ind_permnos)
+        
+        # Build weight matrices for this industry: (T, N_industry)
+        W_prev = np.zeros((n_dates, n_ind_permnos), dtype=np.float32)
+        W_new = np.zeros((n_dates, n_ind_permnos), dtype=np.float32)
+        R_stocks = np.zeros((n_dates, n_ind_permnos), dtype=np.float32)
+        R_industry = np.zeros(n_dates, dtype=np.float32)
+        
+        for t, date_t in enumerate(dates):
+            # Industry return
+            if date_t in industry_returns.index:
+                r_ind = industry_returns.loc[date_t, ind_name]
+                R_industry[t] = 0.0 if pd.isna(r_ind) else r_ind
+            
+            # Current weights
+            if date_t in within_industry_weights and ind_id in within_industry_weights[date_t]:
+                for permno, w in within_industry_weights[date_t][ind_id].items():
+                    if permno in ind_permno_to_idx:
+                        W_new[t, ind_permno_to_idx[permno]] = w
+            
+            # Previous weights (t-1)
+            if t > 0:
+                date_prev = dates[t - 1]
+                if date_prev in within_industry_weights and ind_id in within_industry_weights[date_prev]:
+                    for permno, w in within_industry_weights[date_prev][ind_id].items():
+                        if permno in ind_permno_to_idx:
+                            W_prev[t, ind_permno_to_idx[permno]] = w
+            
+            # Stock returns
+            for permno in ind_permnos:
+                if permno in stock_returns.columns and date_t in stock_returns.index:
+                    r = stock_returns.loc[date_t, permno]
+                    R_stocks[t, ind_permno_to_idx[permno]] = 0.0 if pd.isna(r) else r
+        
+        # Transfer to GPU
+        W_prev_gpu = cp.asarray(W_prev)
+        W_new_gpu = cp.asarray(W_new)
+        R_stocks_gpu = cp.asarray(R_stocks)
+        R_industry_gpu = cp.asarray(R_industry)
+        
+        # Compute drifted weights: W_drifted = W_prev * (1 + R_stock) / (1 + R_industry)
+        R_industry_expanded = R_industry_gpu[:, cp.newaxis]
+        denom = cp.where(cp.abs(1 + R_industry_expanded) > 1e-8, 1 + R_industry_expanded, 1.0)
+        W_drifted = W_prev_gpu * (1 + R_stocks_gpu) / denom
+        
+        # Turnover per date
+        turnover_gpu = cp.abs(W_new_gpu - W_drifted).sum(axis=1)
+        
+        # First date: full investment
+        turnover_gpu[0] = cp.abs(W_new_gpu[0]).sum()
+        
+        # Transfer back
+        turnover_np = cp.asnumpy(turnover_gpu)
+        for t, date_t in enumerate(dates):
+            turnover_df.loc[date_t, ind_name] = turnover_np[t]
+    
+    return turnover_df
+
+
 def calculate_industry_hrp_turnover(industry_weights: pd.DataFrame,
                                     industry_returns: pd.DataFrame,
-                                    portfolio_returns: pd.Series) -> pd.Series:
+                                    portfolio_returns: pd.Series,
+                                    use_gpu: bool = None) -> pd.Series:
     """
     Calculate drift-adjusted turnover ACROSS industries (Stage 2 / HRP cost).
+    GPU-accelerated with CPU fallback.
     
     turnover_t = Σ_k |Ω_k,t^target - Ω_k,t^drifted|
     
@@ -230,12 +459,28 @@ def calculate_industry_hrp_turnover(industry_weights: pd.DataFrame,
         Industry ETF returns (dates × industries)
     portfolio_returns : pd.Series
         Portfolio-level returns
+    use_gpu : bool, optional
+        Force GPU (True) or CPU (False). If None, auto-detect.
         
     Returns
     -------
     pd.Series
         HRP rebalancing turnover across industries
     """
+    # Determine GPU usage
+    if use_gpu is None:
+        use_gpu = GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        return _calculate_industry_hrp_turnover_gpu(industry_weights, industry_returns, portfolio_returns)
+    else:
+        return _calculate_industry_hrp_turnover_cpu(industry_weights, industry_returns, portfolio_returns)
+
+
+def _calculate_industry_hrp_turnover_cpu(industry_weights: pd.DataFrame,
+                                          industry_returns: pd.DataFrame,
+                                          portfolio_returns: pd.Series) -> pd.Series:
+    """CPU implementation of industry HRP turnover."""
     turnover = pd.Series(index=industry_weights.index, dtype=float)
     
     # First period: full investment
@@ -271,6 +516,52 @@ def calculate_industry_hrp_turnover(industry_weights: pd.DataFrame,
         turnover.loc[date_t] = (omega_new - omega_drifted).abs().sum()
     
     return turnover
+
+
+def _calculate_industry_hrp_turnover_gpu(industry_weights: pd.DataFrame,
+                                          industry_returns: pd.DataFrame,
+                                          portfolio_returns: pd.Series) -> pd.Series:
+    """
+    GPU-accelerated implementation of industry HRP turnover.
+    Vectorizes the computation across all dates at once.
+    """
+    import cupy as cp
+    
+    # Align data
+    common_cols = industry_weights.columns.intersection(industry_returns.columns)
+    omega = industry_weights[common_cols].fillna(0)
+    ind_ret = industry_returns.reindex(columns=common_cols, index=industry_weights.index).fillna(0)
+    port_ret = portfolio_returns.reindex(industry_weights.index).fillna(0)
+    
+    # Convert to CuPy arrays
+    W = cp.asarray(omega.values, dtype=cp.float32)  # (T, K)
+    R_ind = cp.asarray(ind_ret.values, dtype=cp.float32)  # (T, K)
+    R_port = cp.asarray(port_ret.values, dtype=cp.float32)  # (T,)
+    
+    T, K = W.shape
+    turnover_gpu = cp.zeros(T, dtype=cp.float32)
+    
+    # First period: full investment
+    turnover_gpu[0] = cp.abs(W[0]).sum()
+    
+    # Vectorized computation
+    W_prev = W[:-1]  # (T-1, K)
+    W_new = W[1:]    # (T-1, K)
+    R_ind_vec = R_ind[1:]  # (T-1, K)
+    R_port_vec = R_port[1:]  # (T-1,)
+    
+    # Drifted weights: W_prev * (1 + R_ind) / (1 + R_port)
+    R_port_expanded = R_port_vec[:, cp.newaxis]
+    denom = cp.where(cp.abs(1 + R_port_expanded) > 1e-8, 1 + R_port_expanded, 1.0)
+    W_drifted = W_prev * (1 + R_ind_vec) / denom
+    
+    # Turnover
+    turnover_vec = cp.abs(W_new - W_drifted).sum(axis=1)
+    turnover_gpu[1:] = turnover_vec
+    
+    # Transfer back to CPU
+    turnover_np = cp.asnumpy(turnover_gpu)
+    return pd.Series(turnover_np, index=industry_weights.index)
 
 
 def compute_two_stage_costs(strategy_returns: pd.Series,
@@ -564,107 +855,7 @@ def compute_strategy_returns(strategy_returns: pd.Series,
     return results
 
 
-def compute_net_returns(strategy_results: pd.DataFrame,
-                        tx_cost_bps: int = 10) -> pd.DataFrame:
-    """
-    Apply transaction costs to strategy returns.
-    
-    Two-layer transaction cost model:
-    
-    1. Inner cost (HRP rebalancing): Cost of trading stocks to reach new target weights
-       - Uses drift-adjusted turnover: |w_target - w_drifted|
-       - Where w_drifted = w_prev × (1 + r_stock) / (1 + r_portfolio)
-       - Scales with leverage: L × turnover × bps
-       
-    2. Outer cost (leverage overlay): Cost of changing allocation between HRP and T-Bills
-       - Charges BOTH sides of the trade (HRP ↔ T-Bill)
-       - outer_cost = 2 × |L_t - L_{t-1}| × C_bps
-       
-    3. Financing cost (asymmetric borrowing): Spread paid when leveraged > 1
-       - When L > 1: pay additional spread on (L-1) borrowed amount
-       - financing_cost = max(L-1, 0) × spread
-    
-    Parameters
-    ----------
-    strategy_results : pd.DataFrame
-        Strategy results from compute_strategy_returns (GROSS returns)
-    tx_cost_bps : int
-        Transaction cost in basis points (default 10)
-        
-    Returns
-    -------
-    pd.DataFrame
-        Strategy results with NET returns and cost breakdown
-    """
-    results = strategy_results.copy()
-    tx_cost = tx_cost_bps / 10000
-    
-    # Get financing spread (stored in strategy_results from compute_strategy_returns)
-    financing_spread_monthly = results['financing_spread'].iloc[0] if 'financing_spread' in results.columns else 0.0
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INNER COST: HRP rebalancing (drift-adjusted turnover × cost)
-    # Turnover = Σ|w_target,t - w_drifted,t| where drift accounts for price changes
-    # ═══════════════════════════════════════════════════════════════════════════
-    results['inner_cost'] = results['hrp_turnover'] * tx_cost
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # NET RETURNS = GROSS RETURNS - COSTS
-    # 
-    # Three cost components:
-    # 1. Inner cost = turnover × bps × leverage (HRP rebalancing)
-    # 2. Outer cost = 2 × |ΔL| × bps (trading HRP ↔ T-Bill)
-    # 3. Financing cost = max(L-1, 0) × spread (borrowing cost when L > 1)
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    # Buy & Hold HRP: Inner cost only, no outer cost, no financing (L=1 always)
-    results['outer_cost_buyhold'] = 0.0
-    results['financing_cost_buyhold'] = 0.0
-    results['hrp_return_net'] = results['hrp_return'] - results['inner_cost']
-    
-    # Binary strategy
-    w_binary = results['allocation_binary']
-    alloc_change_binary = w_binary.diff().abs().fillna(0)
-    results['outer_cost_binary'] = 2 * alloc_change_binary * tx_cost
-    results['financing_cost_binary'] = np.maximum(w_binary - 1, 0) * financing_spread_monthly
-    results['regime_binary_return_net'] = (
-        results['regime_binary_return'] 
-        - w_binary * results['inner_cost']  # Inner cost scales with leverage
-        - results['outer_cost_binary']
-        - results['financing_cost_binary']  # Financing spread when levered
-    )
-    
-    # Probability-weighted strategy
-    w_prob = results['allocation_prob']
-    alloc_change_prob = w_prob.diff().abs().fillna(0)
-    results['outer_cost_prob'] = 2 * alloc_change_prob * tx_cost
-    results['financing_cost_prob'] = np.maximum(w_prob - 1, 0) * financing_spread_monthly
-    results['regime_prob_return_net'] = (
-        results['regime_prob_return']
-        - w_prob * results['inner_cost']
-        - results['outer_cost_prob']
-        - results['financing_cost_prob']
-    )
-    
-    # Scaled probability-weighted strategy
-    w_scaled = results['allocation_prob_scaled']
-    alloc_change_scaled = w_scaled.diff().abs().fillna(0)
-    results['outer_cost_scaled'] = 2 * alloc_change_scaled * tx_cost
-    results['financing_cost_scaled'] = np.maximum(w_scaled - 1, 0) * financing_spread_monthly
-    results['regime_prob_scaled_return_net'] = (
-        results['regime_prob_scaled_return']
-        - w_scaled * results['inner_cost']
-        - results['outer_cost_scaled']
-        - results['financing_cost_scaled']
-    )
-    
-    # Summary statistics
-    logger.info(f"Transaction costs applied ({tx_cost_bps} bps)")
-    logger.info(f"  Inner cost (HRP turnover × L): {(results['inner_cost'] * w_scaled).mean()*12:.2%} annualized (scaled)")
-    logger.info(f"  Outer cost (2 × |ΔL| × bps): {results['outer_cost_scaled'].mean()*12:.2%} annualized")
-    logger.info(f"  Financing cost (spread when L>1): {results['financing_cost_scaled'].mean()*12:.2%} annualized")
-    
-    return results
+# NOTE: compute_net_returns (single-stage) removed - use compute_net_returns_two_stage instead
 
 
 def compute_net_returns_two_stage(strategy_results: pd.DataFrame,
@@ -735,6 +926,17 @@ def compute_net_returns_two_stage(strategy_results: pd.DataFrame,
     # Store cost components
     results['inner_cost_stage1'] = two_stage['inner_cost_total'].reindex(results.index).fillna(0)
     results['outer_cost_stage2'] = two_stage['outer_cost'].reindex(results.index).fillna(0)
+    
+    # Store turnover data for reporting
+    results['hrp_turnover'] = two_stage['outer_turnover'].reindex(results.index).fillna(0)  # HRP (Stage 2) turnover
+    
+    # Store within-industry turnover per industry (for detailed analysis)
+    inner_turnover_df = two_stage['inner_turnover']
+    for col in inner_turnover_df.columns:
+        results[f'turnover_{col}'] = inner_turnover_df[col].reindex(results.index).fillna(0)
+    
+    # Store industry names for later reference
+    results.attrs['industry_names'] = list(inner_turnover_df.columns)
     
     # Combined HRP cost (for Buy & Hold)
     results['inner_cost'] = results['inner_cost_stage1'] + results['outer_cost_stage2']
@@ -812,8 +1014,43 @@ def print_tx_cost_summary_two_stage(results: pd.DataFrame,
     print(f"TWO-STAGE TRANSACTION COST ANALYSIS")
     print("="*80)
     
+    # ══════════════════════════════════════════════════════════════════════════
+    # TURNOVER STATISTICS (Before Cost Application)
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"\n📊 TURNOVER STATISTICS (Annualized)")
+    print("-"*60)
+    
+    # HRP (Stage 2) Turnover
+    if 'hrp_turnover' in results.columns:
+        hrp_turnover_monthly = results['hrp_turnover'].mean()
+        hrp_turnover_annual = hrp_turnover_monthly * 12
+        print(f"   HRP Strategy (Stage 2): {hrp_turnover_annual:.1%} ann ({hrp_turnover_monthly:.2%}/month)")
+    
+    # Within-Industry (Stage 1) Turnover per Industry
+    industry_names = results.attrs.get('industry_names', [])
+    if not industry_names:
+        # Fallback: find turnover columns
+        industry_names = [col.replace('turnover_', '') for col in results.columns if col.startswith('turnover_')]
+    
+    if industry_names:
+        print(f"\n   Within-Industry Turnover (Stage 1) by Industry:")
+        industry_turnovers = {}
+        for ind_name in sorted(industry_names):
+            col = f'turnover_{ind_name}'
+            if col in results.columns:
+                monthly_to = results[col].mean()
+                annual_to = monthly_to * 12
+                industry_turnovers[ind_name] = annual_to
+                print(f"     {ind_name:25s}: {annual_to:6.1%} ann")
+        
+        # Average across industries
+        if industry_turnovers:
+            avg_industry_turnover = sum(industry_turnovers.values()) / len(industry_turnovers)
+            print(f"\n     {'Average (Stage 1)':25s}: {avg_industry_turnover:6.1%} ann")
+    
     # Stage 1: Within-Industry
     inner_ann = results['inner_cost_stage1'].mean() * 12
+    print(f"\n" + "-"*60)
     print(f"\n📊 STAGE 1: WITHIN-INDUSTRY REBALANCING ({inner_cost_bps} bps)")
     print(f"   Formula: inner_k,t = Σ_{'{i∈k}'} |w_i,t^target - w_i,t^drifted| × C_inner")
     print(f"   Annualized Cost: {inner_ann:.2%}")
@@ -860,76 +1097,7 @@ def print_tx_cost_summary_two_stage(results: pd.DataFrame,
         print(f"     TOTAL COST:                {total_ann:.2%} ann")
 
 
-def print_tx_cost_summary(results: pd.DataFrame, tx_cost_bps: int = 10):
-    """
-    Print detailed transaction cost breakdown.
-    
-    Parameters
-    ----------
-    results : pd.DataFrame
-        Strategy results with NET returns from compute_net_returns()
-    tx_cost_bps : int
-        Transaction cost used
-    """
-    print("\n" + "="*80)
-    print(f"TRANSACTION COST ANALYSIS ({tx_cost_bps} bps)")
-    print("="*80)
-    
-    # Inner costs (HRP rebalancing)
-    inner_cost_ann = results['inner_cost'].mean() * 12
-    hrp_turnover_mean = results['hrp_turnover'].mean()
-    print(f"\n📊 INNER COST (HRP Rebalancing - Drift-Adjusted Turnover):")
-    print(f"   Formula: inner_cost = L × turnover × {tx_cost_bps}bps")
-    print(f"   Where:   turnover = Σ|w_target,t - w_drifted,t|")
-    print(f"   Mean Monthly Turnover: {hrp_turnover_mean:.1%}")
-    print(f"   Base Annualized Inner Cost (L=1): {inner_cost_ann:.2%}")
-    
-    # Outer costs (leverage overlay)
-    print(f"\n📊 OUTER COST (Leverage Overlay - Both Sides):")
-    print(f"   Formula: outer_cost = 2 × |L_t - L_{{t-1}}| × {tx_cost_bps}bps")
-    print(f"   Rationale: Changing leverage trades BOTH HRP portfolio AND T-Bills")
-    
-    # Financing costs
-    financing_spread_monthly = results['financing_spread'].iloc[0] if 'financing_spread' in results.columns else 0.0
-    financing_spread_bps = financing_spread_monthly * 12 * 10000  # Convert to annual bps
-    print(f"\n📊 FINANCING COST (Asymmetric Borrowing Spread):")
-    print(f"   Formula: financing_cost = max(L-1, 0) × {financing_spread_bps:.0f}bps/year")
-    print(f"   Rationale: Pay spread over r_f when leveraged (L > 1)")
-    
-    strategies = [
-        ('Buy & Hold HRP', 'outer_cost_buyhold', 'financing_cost_buyhold', 'allocation_binary'),
-        ('P(Bull) Scaled', 'outer_cost_scaled', 'financing_cost_scaled', 'allocation_prob_scaled'),
-    ]
-    
-    print(f"\n📊 COST BREAKDOWN BY STRATEGY:")
-    for name, outer_col, fin_col, alloc_col in strategies:
-        w = results[alloc_col]
-        inner_scaled_ann = (results['inner_cost'] * w).mean() * 12
-        outer_ann = results[outer_col].mean() * 12
-        financing_ann = results[fin_col].mean() * 12 if fin_col in results.columns else 0.0
-        total_cost_ann = inner_scaled_ann + outer_ann + financing_ann
-        alloc_change = w.diff().abs().mean()
-        levered_pct = (w > 1).mean()
-        
-        print(f"\n   {name}:")
-        print(f"     Mean Allocation: {w.mean():.1%}, % Time Leveraged: {levered_pct:.1%}")
-        print(f"     Inner Cost (L × turnover):  {inner_scaled_ann:.2%} ann")
-        print(f"     Outer Cost (2× |ΔL|):       {outer_ann:.2%} ann")
-        print(f"     Financing Cost:             {financing_ann:.2%} ann")
-        print(f"     TOTAL COST:                 {total_cost_ann:.2%} ann")
-    
-    # Total impact
-    print(f"\n📊 GROSS vs NET PERFORMANCE:")
-    print(f"   {'Strategy':<20} {'Gross':>10} {'Net':>10} {'Drag':>10}")
-    print(f"   {'-'*50}")
-    
-    gross_hrp = results['hrp_return'].mean() * 12
-    net_hrp = results['hrp_return_net'].mean() * 12
-    print(f"   {'Buy & Hold HRP':<20} {gross_hrp:>9.1%} {net_hrp:>9.1%} {gross_hrp - net_hrp:>9.2%}")
-    
-    gross_scaled = results['regime_prob_scaled_return'].mean() * 12
-    net_scaled = results['regime_prob_scaled_return_net'].mean() * 12
-    print(f"   {'P(Bull) Scaled':<20} {gross_scaled:>9.1%} {net_scaled:>9.1%} {gross_scaled - net_scaled:>9.2%}")
+# NOTE: print_tx_cost_summary (single-stage) removed - use print_tx_cost_summary_two_stage instead
 
 
 def compute_prediction_quality(strategy_results: pd.DataFrame) -> dict:

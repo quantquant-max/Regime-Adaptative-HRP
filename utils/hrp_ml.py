@@ -40,10 +40,28 @@ logger = setup_logger()
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # =============================================================================
-# GPU Detection for XGBoost
+# GPU Detection for XGBoost and CuPy
 # =============================================================================
 XGB_GPU_AVAILABLE = False
 XGB_DEVICE = 'cpu'
+CUPY_AVAILABLE = False
+cp = None
+
+def _detect_cupy():
+    """Detect if CuPy is available for GPU acceleration."""
+    global CUPY_AVAILABLE, cp
+    try:
+        import cupy as _cp
+        _cp.array([1, 2, 3])  # Test GPU
+        cp = _cp
+        CUPY_AVAILABLE = True
+        logger.info("✓ hrp_ml: CuPy GPU available")
+    except Exception as e:
+        CUPY_AVAILABLE = False
+        cp = None
+        logger.info(f"[!] hrp_ml: CuPy not available ({type(e).__name__})")
+
+_detect_cupy()
 
 def _detect_xgb_gpu():
     """Detect if GPU is available for XGBoost."""
@@ -306,9 +324,11 @@ def _tune_hyperparameters_for_training(X_train: np.ndarray, y_train: np.ndarray,
 def _select_features_for_training(X_train: pd.DataFrame, y_train: np.ndarray,
                                    purge_gap: int = 12, embargo_pct: float = 0.01,
                                    importance_threshold: float = 0.0,
-                                   n_cv_splits: int = 3) -> list:
+                                   n_cv_splits: int = 3,
+                                   use_gpu: bool = None) -> list:
     """
     Select features using permutation importance on training data only.
+    GPU-accelerated with CPU fallback.
     
     This is called inside walk-forward to avoid look-ahead bias in feature selection.
     Uses Purged CV on the training window only.
@@ -327,12 +347,18 @@ def _select_features_for_training(X_train: pd.DataFrame, y_train: np.ndarray,
         Threshold for feature selection
     n_cv_splits : int
         Number of CV splits for feature selection
+    use_gpu : bool, optional
+        Force GPU (True) or CPU (False). If None, auto-detect.
         
     Returns
     -------
     list
         Selected feature names
     """
+    # Determine GPU usage
+    if use_gpu is None:
+        use_gpu = CUPY_AVAILABLE
+    
     xgb_params = {
         'objective': 'binary:logistic',
         'max_depth': 3,
@@ -389,19 +415,15 @@ def _select_features_for_training(X_train: pd.DataFrame, y_train: np.ndarray,
             # Only one class in test set
             continue
         
-        # Permutation importance
-        feature_importance = {}
-        for feat_idx, feat_name in enumerate(feature_names):
-            X_test_permuted = X_test.copy()
-            np.random.seed(get_random_state() + feat_idx)
-            X_test_permuted[:, feat_idx] = np.random.permutation(X_test_permuted[:, feat_idx])
-            
-            dtest_perm = xgb.DMatrix(X_test_permuted, feature_names=feature_names)
-            try:
-                perm_score = roc_auc_score(y_test, model.predict(dtest_perm))
-                feature_importance[feat_name] = baseline_score - perm_score
-            except ValueError:
-                feature_importance[feat_name] = 0.0
+        # Permutation importance - GPU or CPU
+        if use_gpu and CUPY_AVAILABLE:
+            feature_importance = _permutation_importance_gpu(
+                model, X_test, y_test, baseline_score, feature_names
+            )
+        else:
+            feature_importance = _permutation_importance_cpu(
+                model, X_test, y_test, baseline_score, feature_names
+            )
         
         fold_importances.append(feature_importance)
     
@@ -420,6 +442,66 @@ def _select_features_for_training(X_train: pd.DataFrame, y_train: np.ndarray,
         selected = mean_importance.nlargest(3).index.tolist()
     
     return selected
+
+
+def _permutation_importance_cpu(model, X_test: np.ndarray, y_test: np.ndarray,
+                                 baseline_score: float, feature_names: list) -> dict:
+    """CPU implementation of permutation importance."""
+    feature_importance = {}
+    for feat_idx, feat_name in enumerate(feature_names):
+        X_test_permuted = X_test.copy()
+        np.random.seed(get_random_state() + feat_idx)
+        X_test_permuted[:, feat_idx] = np.random.permutation(X_test_permuted[:, feat_idx])
+        
+        dtest_perm = xgb.DMatrix(X_test_permuted, feature_names=feature_names)
+        try:
+            perm_score = roc_auc_score(y_test, model.predict(dtest_perm))
+            feature_importance[feat_name] = baseline_score - perm_score
+        except ValueError:
+            feature_importance[feat_name] = 0.0
+    
+    return feature_importance
+
+
+def _permutation_importance_gpu(model, X_test: np.ndarray, y_test: np.ndarray,
+                                 baseline_score: float, feature_names: list) -> dict:
+    """
+    GPU-accelerated permutation importance.
+    
+    Parallelizes permutation and prediction across all features at once.
+    """
+    import cupy as cp
+    
+    n_samples, n_features = X_test.shape
+    
+    # Transfer to GPU
+    X_gpu = cp.asarray(X_test, dtype=cp.float32)
+    
+    # Generate all permutation indices on GPU at once
+    rng = cp.random.default_rng(get_random_state())
+    perm_indices = cp.zeros((n_features, n_samples), dtype=cp.int32)
+    for f in range(n_features):
+        perm_indices[f] = rng.permutation(n_samples)
+    
+    feature_importance = {}
+    
+    # Process each feature (can't fully parallelize XGBoost predictions)
+    for feat_idx, feat_name in enumerate(feature_names):
+        # Create permuted copy on GPU
+        X_permuted = X_gpu.copy()
+        X_permuted[:, feat_idx] = X_gpu[perm_indices[feat_idx], feat_idx]
+        
+        # Transfer back to CPU for XGBoost prediction
+        X_permuted_cpu = cp.asnumpy(X_permuted)
+        
+        dtest_perm = xgb.DMatrix(X_permuted_cpu, feature_names=feature_names)
+        try:
+            perm_score = roc_auc_score(y_test, model.predict(dtest_perm))
+            feature_importance[feat_name] = baseline_score - perm_score
+        except ValueError:
+            feature_importance[feat_name] = 0.0
+    
+    return feature_importance
 
 
 def walk_forward_predict(X_final: pd.DataFrame, y_final: pd.Series,
@@ -636,6 +718,63 @@ def walk_forward_predict(X_final: pd.DataFrame, y_final: pd.Series,
 # Performance Metrics
 # =============================================================================
 
+def validate_walk_forward_predictions(wf_df: pd.DataFrame, verbose: bool = True) -> dict:
+    """
+    Validate walk-forward prediction DataFrame for data quality.
+    
+    Checks for missing values in P(Bull), P(Bear), and predicted/actual regimes.
+    
+    Parameters
+    ----------
+    wf_df : pd.DataFrame
+        Walk-forward prediction results from walk_forward_predict()
+    verbose : bool
+        If True, print validation summary
+        
+    Returns
+    -------
+    dict
+        Validation results with keys: is_valid, n_missing, details
+    """
+    required_cols = ['prob_bull', 'prob_bear', 'predicted_regime', 'actual_regime']
+    
+    results = {
+        'is_valid': True,
+        'n_total': len(wf_df),
+        'n_missing': {},
+        'details': []
+    }
+    
+    # Check each required column
+    for col in required_cols:
+        if col not in wf_df.columns:
+            results['is_valid'] = False
+            results['details'].append(f"Missing column: {col}")
+            continue
+            
+        n_missing = wf_df[col].isna().sum()
+        results['n_missing'][col] = n_missing
+        
+        if n_missing > 0:
+            results['is_valid'] = False
+            results['details'].append(f"{col}: {n_missing} missing values")
+    
+    # Check probability bounds
+    if 'prob_bull' in wf_df.columns:
+        prob_bull = wf_df['prob_bull'].dropna()
+        if (prob_bull < 0).any() or (prob_bull > 1).any():
+            results['is_valid'] = False
+            results['details'].append("prob_bull contains values outside [0, 1]")
+    
+    if verbose:
+        if results['is_valid']:
+            logger.info(f"✓ Walk-forward predictions validated: {results['n_total']} predictions, no missing values")
+        else:
+            logger.warning(f"✗ Walk-forward validation FAILED: {results['details']}")
+    
+    return results
+
+
 def compute_prediction_metrics(wf_df: pd.DataFrame) -> dict:
     """
     Compute prediction accuracy metrics.
@@ -705,12 +844,13 @@ def _block_bootstrap_indices(n: int, block_size: int, rng: np.random.Generator) 
 
 def compute_metrics_with_ci(returns: pd.Series, n_bootstrap: int = 10000, 
                             ci: float = 0.95, random_state: int = 42,
-                            block_size: int = 12, rf_rate: pd.Series = None) -> dict:
+                            block_size: int = 12, rf_rate: pd.Series = None,
+                            use_gpu: bool = None) -> dict:
     """
     Compute performance metrics with block bootstrap confidence intervals.
     
     Uses circular block bootstrap to preserve autocorrelation structure
-    in financial time series data.
+    in financial time series data. GPU-accelerated when CuPy is available.
     
     Parameters
     ----------
@@ -727,12 +867,17 @@ def compute_metrics_with_ci(returns: pd.Series, n_bootstrap: int = 10000,
     rf_rate : pd.Series, optional
         Monthly risk-free rate for proper excess return Sharpe calculation.
         If None, uses mean Rf = 0 (raw return Sharpe).
+    use_gpu : bool, optional
+        If True, use GPU. If False, use CPU. If None, auto-detect.
         
     Returns
     -------
     dict
         Metrics with confidence intervals
     """
+    if use_gpu is None:
+        use_gpu = CUPY_AVAILABLE
+    
     rng = np.random.default_rng(random_state)
     n = len(returns)
     
@@ -752,7 +897,7 @@ def compute_metrics_with_ci(returns: pd.Series, n_bootstrap: int = 10000,
     ann_vol = returns.std() * np.sqrt(12)
     
     # Sharpe: (mean excess return × 12) / (vol × sqrt(12))
-    # Academic standard: use excess returns in numerator
+    
     ann_rf = mean_rf_monthly * 12
     sharpe = (excess_returns.mean() * 12) / ann_vol if ann_vol > 0 else 0
     
@@ -768,10 +913,43 @@ def compute_metrics_with_ci(returns: pd.Series, n_bootstrap: int = 10000,
     
     win_rate = (returns > 0).mean()
     
-    # Block Bootstrap
-    boot_metrics = {'sharpe': [], 'sortino': [], 'ann_ret': [], 'ann_vol': [], 'max_dd': []}
+    # Block Bootstrap - GPU or CPU
     returns_arr = returns.values
     excess_arr = excess_returns.values
+    
+    if use_gpu and CUPY_AVAILABLE:
+        boot_metrics = _bootstrap_metrics_gpu(returns_arr, excess_arr, n_bootstrap, block_size, random_state)
+    else:
+        boot_metrics = _bootstrap_metrics_cpu(returns_arr, excess_arr, n_bootstrap, block_size, rng)
+    
+    alpha = (1 - ci) / 2
+    
+    return {
+        'Cum Return': cum_ret,
+        'Ann Return': ann_ret,
+        'Ann Return CI': (np.percentile(boot_metrics['ann_ret'], alpha*100), 
+                          np.percentile(boot_metrics['ann_ret'], (1-alpha)*100)),
+        'Ann Vol': ann_vol,
+        'Ann Vol CI': (np.percentile(boot_metrics['ann_vol'], alpha*100), 
+                       np.percentile(boot_metrics['ann_vol'], (1-alpha)*100)),
+        'Sharpe': sharpe,
+        'Sharpe CI': (np.percentile(boot_metrics['sharpe'], alpha*100), 
+                      np.percentile(boot_metrics['sharpe'], (1-alpha)*100)),
+        'Sortino': sortino,
+        'Sortino CI': (np.percentile(boot_metrics['sortino'], alpha*100), 
+                       np.percentile(boot_metrics['sortino'], (1-alpha)*100)),
+        'Max DD': max_dd,
+        'Max DD CI': (np.percentile(boot_metrics['max_dd'], alpha*100), 
+                      np.percentile(boot_metrics['max_dd'], (1-alpha)*100)),
+        'Win Rate': win_rate
+    }
+
+
+def _bootstrap_metrics_cpu(returns_arr: np.ndarray, excess_arr: np.ndarray,
+                           n_bootstrap: int, block_size: int, rng: np.random.Generator) -> dict:
+    """CPU implementation of bootstrap metrics computation."""
+    n = len(returns_arr)
+    boot_metrics = {'sharpe': [], 'sortino': [], 'ann_ret': [], 'ann_vol': [], 'max_dd': []}
     
     for _ in range(n_bootstrap):
         boot_idx = _block_bootstrap_indices(n, block_size, rng)
@@ -799,26 +977,100 @@ def compute_metrics_with_ci(returns: pd.Series, n_bootstrap: int = 10000,
         boot_metrics['ann_vol'].append(b_ann_vol)
         boot_metrics['max_dd'].append(b_max_dd)
     
-    alpha = (1 - ci) / 2
+    return boot_metrics
+
+
+def _bootstrap_metrics_gpu(returns_arr: np.ndarray, excess_arr: np.ndarray,
+                           n_bootstrap: int, block_size: int, random_state: int) -> dict:
+    """
+    GPU-accelerated bootstrap metrics using CuPy.
     
+    Generates all bootstrap indices at once and computes metrics in parallel.
+    """
+    n = len(returns_arr)
+    n_blocks_needed = int(np.ceil(n / block_size))
+    
+    # Transfer data to GPU
+    returns_gpu = cp.asarray(returns_arr)
+    excess_gpu = cp.asarray(excess_arr)
+    
+    # Generate all bootstrap indices on GPU at once
+    # Shape: (n_bootstrap, n_blocks_needed)
+    rng = cp.random.default_rng(random_state)
+    block_starts = rng.integers(0, n, size=(n_bootstrap, n_blocks_needed))
+    
+    # Build all bootstrap samples in parallel
+    # Create index offsets for each block: 0, 1, 2, ..., block_size-1
+    block_offsets = cp.arange(block_size)
+    
+    # Expand block_starts to full indices: (n_bootstrap, n_blocks_needed, block_size)
+    all_indices = (block_starts[:, :, cp.newaxis] + block_offsets) % n
+    
+    # Reshape to (n_bootstrap, n_blocks_needed * block_size) and truncate to n
+    all_indices = all_indices.reshape(n_bootstrap, -1)[:, :n]
+    
+    # Gather bootstrap samples: (n_bootstrap, n)
+    boot_returns_all = returns_gpu[all_indices]
+    boot_excess_all = excess_gpu[all_indices]
+    
+    # Compute all metrics in parallel across all bootstrap samples
+    # Cumulative returns
+    b_cum_ret = cp.prod(1 + boot_returns_all, axis=1) - 1
+    b_ann_ret = (1 + b_cum_ret) ** (12 / n) - 1
+    
+    # Volatility
+    b_ann_vol = cp.std(boot_returns_all, axis=1) * cp.sqrt(12)
+    
+    # Sharpe ratio
+    b_sharpe = cp.where(b_ann_vol > 0,
+                        (cp.mean(boot_excess_all, axis=1) * 12) / b_ann_vol,
+                        0.0)
+    
+    # Sortino ratio - need to handle downside separately
+    # Create masked arrays for downside returns
+    downside_mask = boot_excess_all < 0
+    downside_excess = cp.where(downside_mask, boot_excess_all, cp.nan)
+    
+    # Compute downside std ignoring NaNs
+    downside_sum = cp.nansum(downside_excess ** 2, axis=1)
+    downside_count = cp.sum(downside_mask, axis=1)
+    downside_var = cp.where(downside_count > 1,
+                            downside_sum / (downside_count - 1),
+                            b_ann_vol ** 2 / 12)  # fallback to total vol
+    b_down_vol = cp.sqrt(downside_var) * cp.sqrt(12)
+    
+    b_sortino = cp.where(b_down_vol > 0,
+                         (cp.mean(boot_excess_all, axis=1) * 12) / b_down_vol,
+                         0.0)
+    
+    # Max drawdown - need cumulative product and running max
+    b_cum_rets = cp.cumprod(1 + boot_returns_all, axis=1)
+    
+    # WORKAROUND: cp.maximum.accumulate is not implemented in some CuPy versions
+    # and cp.cummax might be missing.
+    # Fallback to CPU for this specific accumulation step which is fast enough.
+    try:
+        if hasattr(cp, 'cummax'):
+             b_rolling_max = cp.cummax(b_cum_rets, axis=1)
+        else:
+             b_rolling_max = cp.maximum.accumulate(b_cum_rets, axis=1)
+        
+        b_drawdowns = b_cum_rets / b_rolling_max - 1
+        b_max_dd = cp.min(b_drawdowns, axis=1)
+    except (AttributeError, NotImplementedError, TypeError):
+        # Failover to CPU NumPyo
+        b_cum_rets_cpu = cp.asnumpy(b_cum_rets)
+        b_rolling_max_cpu = np.maximum.accumulate(b_cum_rets_cpu, axis=1)
+        b_drawdowns_cpu = b_cum_rets_cpu / b_rolling_max_cpu - 1
+        b_max_dd = cp.asarray(np.min(b_drawdowns_cpu, axis=1))
+    
+    # Transfer back to CPU
     return {
-        'Cum Return': cum_ret,
-        'Ann Return': ann_ret,
-        'Ann Return CI': (np.percentile(boot_metrics['ann_ret'], alpha*100), 
-                          np.percentile(boot_metrics['ann_ret'], (1-alpha)*100)),
-        'Ann Vol': ann_vol,
-        'Ann Vol CI': (np.percentile(boot_metrics['ann_vol'], alpha*100), 
-                       np.percentile(boot_metrics['ann_vol'], (1-alpha)*100)),
-        'Sharpe': sharpe,
-        'Sharpe CI': (np.percentile(boot_metrics['sharpe'], alpha*100), 
-                      np.percentile(boot_metrics['sharpe'], (1-alpha)*100)),
-        'Sortino': sortino,
-        'Sortino CI': (np.percentile(boot_metrics['sortino'], alpha*100), 
-                       np.percentile(boot_metrics['sortino'], (1-alpha)*100)),
-        'Max DD': max_dd,
-        'Max DD CI': (np.percentile(boot_metrics['max_dd'], alpha*100), 
-                      np.percentile(boot_metrics['max_dd'], (1-alpha)*100)),
-        'Win Rate': win_rate
+        'sharpe': cp.asnumpy(b_sharpe).tolist(),
+        'sortino': cp.asnumpy(b_sortino).tolist(),
+        'ann_ret': cp.asnumpy(b_ann_ret).tolist(),
+        'ann_vol': cp.asnumpy(b_ann_vol).tolist(),
+        'max_dd': cp.asnumpy(b_max_dd).tolist()
     }
 
 
@@ -826,12 +1078,13 @@ def bootstrap_sharpe_test(baseline_returns: np.ndarray,
                           strategy_returns: np.ndarray,
                           n_bootstrap: int = 10000,
                           random_state: int = 42,
-                          block_size: int = 12) -> tuple[float, tuple, str]:
+                          block_size: int = 12,
+                          use_gpu: bool = None) -> tuple[float, tuple, str]:
     """
     Block bootstrap test for Sharpe ratio difference.
     
     Uses circular block bootstrap with paired resampling to preserve
-    autocorrelation and correlation between strategies.
+    autocorrelation and correlation between strategies. GPU-accelerated when available.
     
     Parameters
     ----------
@@ -845,12 +1098,40 @@ def bootstrap_sharpe_test(baseline_returns: np.ndarray,
         Random seed
     block_size : int
         Block size for bootstrap (default 12 for monthly data)
+    use_gpu : bool, optional
+        If True, use GPU. If False, use CPU. If None, auto-detect.
         
     Returns
     -------
     tuple[float, tuple, str]
         Mean difference, confidence interval, significance string
     """
+    if use_gpu is None:
+        use_gpu = CUPY_AVAILABLE
+    
+    if use_gpu and CUPY_AVAILABLE:
+        sharpe_diffs = _bootstrap_sharpe_test_gpu(baseline_returns, strategy_returns, 
+                                                   n_bootstrap, block_size, random_state)
+    else:
+        sharpe_diffs = _bootstrap_sharpe_test_cpu(baseline_returns, strategy_returns,
+                                                   n_bootstrap, block_size, random_state)
+    
+    diff_mean = np.mean(sharpe_diffs)
+    diff_ci = (np.percentile(sharpe_diffs, 2.5), np.percentile(sharpe_diffs, 97.5))
+    
+    if diff_ci[0] > 0:
+        significance = "Significantly BETTER"
+    elif diff_ci[1] < 0:
+        significance = "Significantly WORSE"
+    else:
+        significance = "Not significant"
+    
+    return diff_mean, diff_ci, significance
+
+
+def _bootstrap_sharpe_test_cpu(baseline_returns: np.ndarray, strategy_returns: np.ndarray,
+                                n_bootstrap: int, block_size: int, random_state: int) -> list:
+    """CPU implementation of bootstrap Sharpe test."""
     rng = np.random.default_rng(random_state)
     n = len(baseline_returns)
     sharpe_diffs = []
@@ -865,17 +1146,53 @@ def bootstrap_sharpe_test(baseline_returns: np.ndarray,
         strat_sharpe = (strat_boot.mean() * 12) / (strat_boot.std() * np.sqrt(12)) if strat_boot.std() > 0 else 0
         sharpe_diffs.append(strat_sharpe - base_sharpe)
     
-    diff_mean = np.mean(sharpe_diffs)
-    diff_ci = (np.percentile(sharpe_diffs, 2.5), np.percentile(sharpe_diffs, 97.5))
+    return sharpe_diffs
+
+
+def _bootstrap_sharpe_test_gpu(baseline_returns: np.ndarray, strategy_returns: np.ndarray,
+                                n_bootstrap: int, block_size: int, random_state: int) -> np.ndarray:
+    """
+    GPU-accelerated bootstrap Sharpe test using CuPy.
     
-    if diff_ci[0] > 0:
-        significance = "Significantly BETTER"
-    elif diff_ci[1] < 0:
-        significance = "Significantly WORSE"
-    else:
-        significance = "Not significant"
+    Generates all bootstrap indices at once and computes Sharpe differences in parallel.
+    """
+    n = len(baseline_returns)
+    n_blocks_needed = int(np.ceil(n / block_size))
     
-    return diff_mean, diff_ci, significance
+    # Transfer data to GPU
+    baseline_gpu = cp.asarray(baseline_returns)
+    strategy_gpu = cp.asarray(strategy_returns)
+    
+    # Generate all bootstrap indices on GPU at once
+    rng = cp.random.default_rng(random_state)
+    block_starts = rng.integers(0, n, size=(n_bootstrap, n_blocks_needed))
+    
+    # Build all bootstrap samples in parallel
+    block_offsets = cp.arange(block_size)
+    all_indices = (block_starts[:, :, cp.newaxis] + block_offsets) % n
+    all_indices = all_indices.reshape(n_bootstrap, -1)[:, :n]
+    
+    # Gather bootstrap samples: (n_bootstrap, n)
+    base_boot_all = baseline_gpu[all_indices]
+    strat_boot_all = strategy_gpu[all_indices]
+    
+    # Compute Sharpe ratios for all bootstrap samples in parallel
+    base_mean = cp.mean(base_boot_all, axis=1)
+    base_std = cp.std(base_boot_all, axis=1)
+    base_sharpe = cp.where(base_std > 0,
+                           (base_mean * 12) / (base_std * cp.sqrt(12)),
+                           0.0)
+    
+    strat_mean = cp.mean(strat_boot_all, axis=1)
+    strat_std = cp.std(strat_boot_all, axis=1)
+    strat_sharpe = cp.where(strat_std > 0,
+                            (strat_mean * 12) / (strat_std * cp.sqrt(12)),
+                            0.0)
+    
+    sharpe_diffs = strat_sharpe - base_sharpe
+    
+    # Transfer back to CPU
+    return cp.asnumpy(sharpe_diffs)
 
 
 def get_top_n_drawdowns(returns: pd.Series, n: int = 3) -> list:
@@ -1059,7 +1376,69 @@ def print_performance_summary(strategy_results: pd.DataFrame,
     return metrics_summary
 
 
-def print_xgb_summary(metrics: dict, feature_importances: list, top_n: int = 5):
+def print_prediction_coverage(wf_df: pd.DataFrame):
+    """
+    Print XGBoost prediction date range and check for gaps/missing values.
+    
+    Parameters
+    ----------
+    wf_df : pd.DataFrame
+        Walk-forward prediction results with DateTimeIndex
+    """
+    # Ensure datetime index
+    if not isinstance(wf_df.index, pd.DatetimeIndex):
+        wf_df = wf_df.copy()
+        wf_df.index = pd.to_datetime(wf_df.index)
+    
+    # Date range
+    start_date = wf_df.index.min()
+    end_date = wf_df.index.max()
+    n_months = len(wf_df)
+    
+    print(f"\n{'='*70}")
+    print("XGBOOST PREDICTION COVERAGE")
+    print(f"{'='*70}")
+    print(f"  Start: {start_date.strftime('%Y-%m-%d')}")
+    print(f"  End:   {end_date.strftime('%Y-%m-%d')}")
+    print(f"  Total: {n_months} months ({(end_date.year - start_date.year)} years)")
+    
+    # Check for missing months (gaps in the time series)
+    expected_months = pd.date_range(start=start_date, end=end_date, freq='ME')
+    wf_months = wf_df.index.to_period('M').to_timestamp('M')
+    
+    # Find missing months
+    missing_months = expected_months.difference(wf_months)
+    
+    if len(missing_months) > 0:
+        print(f"\n  ⚠ GAPS DETECTED: {len(missing_months)} missing months")
+        if len(missing_months) <= 10:
+            for m in missing_months:
+                print(f"    - {m.strftime('%Y-%m')}")
+        else:
+            print(f"    First 5: {', '.join(m.strftime('%Y-%m') for m in missing_months[:5])}")
+            print(f"    Last 5:  {', '.join(m.strftime('%Y-%m') for m in missing_months[-5:])}")
+    else:
+        print(f"\n  ✓ No gaps: continuous monthly coverage")
+    
+    # Check for NaN values in key columns
+    key_cols = ['prob_bull', 'y_pred', 'y_true']
+    available_cols = [c for c in key_cols if c in wf_df.columns]
+    
+    nan_counts = wf_df[available_cols].isna().sum()
+    total_nans = nan_counts.sum()
+    
+    if total_nans > 0:
+        print(f"\n  ⚠ MISSING VALUES DETECTED:")
+        for col, count in nan_counts.items():
+            if count > 0:
+                print(f"    - {col}: {count} NaN values")
+    else:
+        print(f"  ✓ No missing values in predictions")
+    
+    print(f"{'='*70}")
+
+
+def print_xgb_summary(metrics: dict, feature_importances: list, top_n: int = 5, wf_df: pd.DataFrame = None):
     """
     Print XGBoost prediction summary (confusion matrix + top features).
     
@@ -1071,7 +1450,13 @@ def print_xgb_summary(metrics: dict, feature_importances: list, top_n: int = 5):
         List of dicts with feature importance by date
     top_n : int
         Number of top features to display
+    wf_df : pd.DataFrame, optional
+        Walk-forward predictions DataFrame for coverage analysis
     """
+    # Print prediction coverage if wf_df provided
+    if wf_df is not None:
+        print_prediction_coverage(wf_df)
+    
     cm = metrics['confusion_matrix']
     print(f"\nConfusion Matrix:")
     print(f"                    Predicted Bear  Predicted Bull")

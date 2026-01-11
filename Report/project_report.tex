@@ -1,5 +1,5 @@
 % SIAM Article - HRP Portfolio Optimization with Regime-Based Enhancement
-\documentclass[review,onefignum,onetabnum]{siamart171218}
+\documentclass[final,onefignum,onetabnum]{siamart171218}
 
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{graphicx}
@@ -9,10 +9,11 @@
 \usepackage{hyperref}
 \usepackage{cleveref}
 \usepackage{titlesec}
+\usepackage{float}
 
 % TikZ for diagrams
 \usepackage{tikz}
-\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc, backgrounds, fit, decorations.pathreplacing}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc, backgrounds, fit, decorations.pathreplacing, patterns}
 
 % ============================================================================
 % FORMATTING: Centered titles and increased spacing
@@ -53,17 +54,17 @@
 % TikZ Style Definitions for Pipeline Diagrams
 % ============================================================================
 \tikzstyle{databox} = [rectangle, rounded corners, minimum width=2cm, minimum height=0.8cm, 
-                       text centered, draw=blue!70, fill=blue!10, font=\small]
+                       text centered, draw=black, fill=white, font=\small, text width=1.8cm, align=center]
 \tikzstyle{processbox} = [rectangle, rounded corners, minimum width=2cm, minimum height=0.8cm,
-                          text centered, draw=orange!70, fill=orange!10, font=\small]
+                          text centered, draw=black, fill=white, font=\small, text width=1.8cm, align=center]
 \tikzstyle{outputbox} = [rectangle, rounded corners, minimum width=2cm, minimum height=0.8cm,
-                         text centered, draw=green!70, fill=green!20, font=\small]
+                         text centered, draw=black, fill=white, font=\small, text width=1.8cm, align=center]
 \tikzstyle{mlbox} = [rectangle, rounded corners, minimum width=2cm, minimum height=0.8cm,
-                     text centered, draw=purple!70, fill=purple!10, font=\small]
-\tikzstyle{arrow} = [thick, ->, >=Stealth]
-\tikzstyle{doublearrow} = [thick, <->, >=Stealth]
+                     text centered, draw=black, fill=white, font=\small, text width=1.8cm, align=center]
+\tikzstyle{arrow} = [thick, ->, >=Stealth, black]
+\tikzstyle{doublearrow} = [thick, <->, >=Stealth, black]
 \tikzstyle{phasebox} = [rectangle, rounded corners, minimum width=2.5cm, minimum height=1cm,
-                        text centered, draw=black!50, fill=white, font=\small, text width=2.3cm]
+                        text centered, draw=black!50, fill=white, font=\small, text width=2.3cm, align=center]
 \tikzstyle{timeblock} = [rectangle, minimum width=1.5cm, minimum height=0.6cm, 
                          text centered, font=\scriptsize]
 
@@ -79,7 +80,7 @@
 
 \title{Regime-Adaptive Hierarchical Risk Parity: A Machine Learning Approach to Dynamic Portfolio Allocation}
 
-\author{Lucas Jaccard\thanks{Master of Finance (HEC Lausanne), Advanced Data Analysis Course, January 2026.}}
+\author{Lucas Jaccard \quad|\quad HEC Lausanne}
 
 \maketitle
 
@@ -87,7 +88,7 @@
 % ABSTRACT
 %==============================================================================
 \begin{abstract}
-This paper presents a regime-adaptive portfolio framework combining Hierarchical Risk Parity (HRP) with Hidden Markov Model (HMM) regime detection and XGBoost prediction. Using CRSP data (1965--2024), a GPU-accelerated HRP portfolio is constructed with RMT denoising and a forward-only HMM filter using log returns, downside deviation, and Michigan Consumer Sentiment. The regime-adaptive strategy achieves a Sharpe ratio of 0.85 vs.\ 0.51 for static HRP and 0.54 for the market, after transaction costs. Critically, maximum drawdown falls from 45.7\% to 21.0\%, with all five worst drawdowns ($-$21.0\% to $-$13.5\%) smaller than static HRP's \textit{fifth} worst ($-$22.3\%). The XGBoost model achieves 66.2\% accuracy with 72.9\% bear recall out-of-sample.
+This paper presents a regime-adaptive portfolio framework combining Hierarchical Risk Parity (HRP) with Hidden Markov Model (HMM) regime detection and XGBoost prediction. Using CRSP data (1960--2024), we address the fundamental challenge of covariance estimation with monthly data: a 60-month lookback window is insufficient to estimate a stable covariance matrix for hundreds of individual stocks ($N \gg T$). Our solution employs a \textbf{two-stage industry ETF approach}: (1) aggregate stocks into 12 value-weighted Fama-French industry portfolios, then (2) apply HRP to these 12 synthetic ETFs, ensuring $N=12 < T=60$ for a statistically valid, full-rank covariance matrix. A forward-only HMM filter using log returns, downside deviation, and Michigan Consumer Sentiment identifies market regimes without look-ahead bias. The regime-adaptive strategy achieves a Sharpe ratio of 0.85 vs.\ 0.56 for static HRP, after transaction costs. Critically, maximum drawdown falls from 47.1\% to 25.2\%, demonstrating significant tail risk reduction.
 \end{abstract}
 
 %==============================================================================
@@ -119,43 +120,37 @@ Longin and Solnik \cite{longin2001} highlight a critical property of equity mark
 \paragraph{Research Question.}
 These observations motivate a natural question: \textit{Can portfolio construction capture the benefits of diversification in calm markets while dynamically reducing exposure before drawdowns materialize?}
 
-\paragraph{Contributions.}
-This work makes four contributions: (1) GPU-accelerated HRP with Random Matrix Theory denoising following Marchenko and Pastur \cite{marchenko1967} and Laloux et al.\ \cite{laloux1999}; (2) A forward-only HMM filter that avoids look-ahead bias from standard smoothed posteriors as in Hamilton \cite{hamilton1989}, combined with XGBoost (Chen and Guestrin \cite{chen2016}) for regime prediction; (3) Walk-forward backtesting with purged cross-validation following L\'opez de Prado \cite{lopez2018}; (4) Empirical evidence that drawdown reduction---not Sharpe ratio improvement---is the primary achievement.
-
-\paragraph{Related Work.}
-HRP was extended to multi-period settings by Raffinot \cite{raffinot2018}. Regime-switching models for asset allocation were studied by Ang and Bekaert \cite{ang2002} and Guidolin and Timmermann \cite{guidolin2007}. Machine learning for return prediction was surveyed by Gu, Kelly, and Xiu \cite{gu2020}. Consumer sentiment as a market predictor was examined by Lemmon and Portniaguina \cite{lemmon2006}. This work bridges HRP and ML-based regime prediction---a gap in the existing literature.
-
 %==============================================================================
 % 3. METHODOLOGY
 %==============================================================================
 \section{Methodology}
 \label{sec:methodology}
 
-The methodology consists of two parts: (1) the base HRP portfolio construction with RMT denoising, and (2) the regime-adaptive enhancement using HMM and XGBoost. This section presents a detailed 7-stage pipeline for Part 1 and a 6-phase pipeline for Part 2.
+The methodology consists of two parts: (1) the base HRP portfolio construction using a two-stage industry ETF approach, and (2) the regime-adaptive enhancement using HMM and XGBoost.
 
 \subsection{Part 1: Hierarchical Risk Parity}
 
-The HRP weight computation follows a 7-stage pipeline executed at each monthly rebalancing date. \Cref{fig:hrp-pipeline} provides a visual overview of this process.
+The HRP weight computation follows L\'opez de Prado \cite{lopez2016} and is applied to synthetic industry ETFs constructed from CRSP stocks. \Cref{fig:hrp-pipeline} provides a visual overview; complete algorithmic details are in \Cref{app:hrp}.
 
-\begin{figure}[htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.4cm and 0.3cm]
     % Row 1: Data Preparation
     \node[databox] (universe) {1. Universe\\Filter};
-    \node[databox, right=of universe] (returns) {2. Returns\\Extraction};
-    \node[processbox, right=of returns] (rmt) {3. RMT\\Denoising};
-    \node[processbox, right=of rmt] (distance) {4. Distance\\Matrix};
+    \node[databox, right=of universe] (industry) {2. Industry\\ETF};
+    \node[processbox, right=of industry] (covariance) {3. Sample\\Covariance};
+    \node[processbox, right=of covariance] (distance) {4. Distance\\Matrix};
     
     % Row 2: Clustering and Output
-    \node[processbox, below=0.8cm of distance] (cluster) {5. Hierarchical\\Clustering};
-    \node[processbox, left=of cluster] (seriation) {6. Quasi-\\Diagonalization};
+    \node[processbox, below=0.8cm of distance] (cluster) {5. Clustering};
+    \node[processbox, left=of cluster] (seriation) {6. Seriation};
     \node[outputbox, left=of seriation] (bisection) {7. Recursive\\Bisection};
     \node[outputbox, left=of bisection] (weights) {\textbf{HRP}\\$\mathbf{w}_t$};
     
     % Arrows Row 1
-    \draw[arrow] (universe) -- (returns);
-    \draw[arrow] (returns) -- (rmt);
-    \draw[arrow] (rmt) -- (distance);
+    \draw[arrow] (universe) -- (industry);
+    \draw[arrow] (industry) -- (covariance);
+    \draw[arrow] (covariance) -- (distance);
     
     % Arrow down
     \draw[arrow] (distance) -- (cluster);
@@ -164,106 +159,32 @@ The HRP weight computation follows a 7-stage pipeline executed at each monthly r
     \draw[arrow] (cluster) -- (seriation);
     \draw[arrow] (seriation) -- (bisection);
     \draw[arrow] (bisection) -- (weights);
-    
-    % Labels
-    \node[above=0.15cm of universe, font=\scriptsize\itshape, text=blue!70] {CRSP data};
-    \node[above=0.15cm of rmt, font=\scriptsize\itshape, text=orange!70] {Noise filtering};
-    \node[below=0.15cm of weights, font=\scriptsize\itshape, text=green!70] {Portfolio};
 \end{tikzpicture}
-\caption{HRP 7-Stage Pipeline. Blue boxes represent data inputs, orange boxes represent transformations, and green boxes represent outputs. The pipeline flows from raw CRSP data through RMT denoising, hierarchical clustering, and recursive bisection to produce final portfolio weights.}
+\caption{Two-Stage HRP Pipeline: universe filtering, industry aggregation, covariance estimation, and hierarchical weight allocation.}
 \label{fig:hrp-pipeline}
 \end{figure}
 
-\subsubsection{Stage 1: Universe Construction}
-At each rebalancing date $t$, the investable universe is constructed from CRSP common shares (SHRCD $\in \{10, 11\}$) listed on NYSE, NASDAQ, or AMEX (EXCHCD $\in \{1, 2, 3\}$). A two-stage liquidity filter is then applied within each Fama-French 12 industry classification:
-\begin{equation}
-    \mathcal{U}_t = \left\{ i : V^{med}_{i,t} \geq Q_{80\%}(V^{med}_{ind(i),t}) \text{ and } P_{i,t} > \$3 \right\}
-\end{equation}
-where $V^{med}_{i,t}$ is the rolling 12-month median dollar volume (with minimum 6 valid observations), and $Q_{80\%}$ denotes the 80th percentile within each industry. This selects the top 20\% most liquid stocks per industry while excluding penny stocks.
+\subsubsection{Universe Construction and Industry Aggregation}
+At each rebalancing date, the investable universe includes only CRSP common shares (SHRCD $\in \{10, 11\}$) listed on NYSE, NASDAQ, or AMEX (EXCHCD $\in \{1, 2, 3\}$), excluding stocks priced below \$3. Within each Fama-French 12 industry, the top 20\% most liquid stocks---based on rolling 12-month median dollar volume---are retained to construct value-weighted synthetic industry ETFs. Formulas are provided in \Cref{app:liquidity}.
 
-\subsubsection{Stage 2: Return Extraction}
-For each rebalancing date $t$, a 60-month ($T=60$) lookback window of returns is extracted for $N$ stocks passing the universe filter. Only stocks with all 60 monthly returns available are included:
-\begin{equation}
-    \mathbf{R}_{t} \in \mathbb{R}^{T \times N}, \quad \text{where } R_{s,i} = r_{i,s} \text{ for } s \in [t-59, t]
-\end{equation}
-
-\subsubsection{Stage 3: RMT Covariance Denoising}
-Sample covariance matrices are notoriously noisy when $N$ approaches $T$. Random Matrix Theory (RMT) denoising is applied following Laloux et al.\ \cite{laloux1999}:
-
-\paragraph{Step 3a: Decomposition.} Convert the covariance matrix to a correlation matrix $\mathbf{C}$ while preserving individual volatilities $\sigma_i$.
-
-\paragraph{Step 3b: Eigendecomposition.}
-\begin{equation}
-    \mathbf{C} = \mathbf{V} \boldsymbol{\Lambda} \mathbf{V}^\top, \quad \boldsymbol{\Lambda} = \text{diag}(\lambda_1, \ldots, \lambda_N)
-\end{equation}
-
-\paragraph{Step 3c: Marchenko-Pastur Threshold.} The threshold separating signal from noise eigenvalues is:
-\begin{equation}
-    \lambda_{\max} = \hat{\sigma}^2 \left(1 + \sqrt{\frac{N}{T}}\right)^2
-\end{equation}
-where $\hat{\sigma}^2 = \text{median}(\lambda_1, \ldots, \lambda_N)$ is a robust estimator of the noise variance (Laloux et al.\ \cite{laloux1999}).
-
-\paragraph{Step 3d: Denoising.} Eigenvalues below $\lambda_{\max}$ are replaced with their mean:
-\begin{equation}
-    \tilde{\lambda}_k = \begin{cases}
-        \lambda_k & \text{if } \lambda_k > \lambda_{\max} \text{ (signal)} \\
-        \bar{\lambda}_{noise} & \text{otherwise (noise)}
-    \end{cases}
-\end{equation}
-
-\paragraph{Step 3e: Reconstruction.} The denoised correlation matrix is reconstructed as $\tilde{\mathbf{C}} = \mathbf{V} \tilde{\boldsymbol{\Lambda}} \mathbf{V}^\top$, then converted back to covariance: $\tilde{\boldsymbol{\Sigma}} = \text{diag}(\boldsymbol{\sigma}) \cdot \tilde{\mathbf{C}} \cdot \text{diag}(\boldsymbol{\sigma})$.
-
-\subsubsection{Stage 4: Distance Matrix Construction}
-The denoised correlation matrix is converted to a distance matrix using a two-step process following L\'opez de Prado \cite{lopez2016}:
-
-\paragraph{Step 4a: Correlation Distance.} First, the angular distance between each pair of assets is computed:
-\begin{equation}
-    d_{i,j} = \sqrt{\frac{1}{2}(1 - \rho_{i,j})} \in [0, 1]
-\end{equation}
-This maps perfect correlation ($\rho=1$) to zero distance and perfect anti-correlation ($\rho=-1$) to maximum distance.
-
-\paragraph{Step 4b: Euclidean Distance on Correlation Profiles.} Second, the Euclidean distance between each asset's correlation profile (i.e., its row in the distance matrix) is computed:
-\begin{equation}
-    \tilde{d}_{i,j} = \sqrt{\sum_{k=1}^{N} (d_{k,i} - d_{k,j})^2}
-\end{equation}
-This captures how similarly two assets correlate with the \textit{entire universe}. Two assets may have similar pairwise correlation but very different correlation patterns with other assets; this step distinguishes them.
-
-\subsubsection{Stage 5: Hierarchical Clustering}
-Ward's method \cite{ward1963} performs agglomerative clustering by iteratively merging the pair of clusters that minimizes the increase in total within-cluster variance:
-\begin{equation}
-    \Delta(A, B) = \frac{n_A n_B}{n_A + n_B} \| \bar{d}_A - \bar{d}_B \|^2
-\end{equation}
-The output is a dendrogram (binary tree) representing the hierarchical structure of asset similarities.
-
-\subsubsection{Stage 6: Quasi-Diagonalization (Seriation)}
-The dendrogram is reordered so that similar assets are placed adjacent, producing a quasi-diagonal covariance matrix. This seriation step traverses the tree and orders leaves such that the largest cluster elements appear first, creating a banded structure that facilitates the recursive bisection.
-
-\subsubsection{Stage 7: Recursive Bisection}
-Weights are allocated through top-down recursive bisection of the seriated dendrogram. At each node splitting cluster $C$ into $C_1$ and $C_2$:
-\begin{equation}
-    \alpha = 1 - \frac{\tilde{V}_{C_1}}{\tilde{V}_{C_1} + \tilde{V}_{C_2}}, \quad w_{C_1} = \alpha \cdot w_C, \quad w_{C_2} = (1-\alpha) \cdot w_C
-\end{equation}
-where $\tilde{V}_C$ is the cluster variance computed as an inverse-variance portfolio:
-\begin{equation}
-    \tilde{V}_C = \left( \sum_{i \in C} \frac{1}{\sigma_i^2} \right)^{-1} \cdot \mathbf{1}^\top \boldsymbol{\Sigma}_C^{-1} \mathbf{1}
-\end{equation}
-This allocates more weight to the lower-variance branch at each split, producing a risk-balanced portfolio without matrix inversion of the full covariance matrix.
+\subsubsection{Motivation for Industry Aggregation}
+With monthly CRSP returns and a 60-month lookback window ($T = 60$), estimating covariance for $N \approx 500$ stocks yields a singular matrix ($T/N < 1$). Shrinkage estimators \cite{ledoit2004} fail when $N \gg T$ as shrinkage intensity approaches unity, discarding sample information entirely. Aggregating stocks into $N = 12$ industry portfolios transforms the problem from an intractable $500 \times 500$ estimation to a well-posed $12 \times 12$ estimation, where the sample covariance is full-rank and statistically well-conditioned.
 
 \subsection{Part 2: Regime-Adaptive Enhancement}
 
-The regime-adaptive enhancement follows a 6-phase pipeline that predicts market regimes and adjusts portfolio exposure accordingly. \Cref{fig:ml-pipeline} illustrates the complete workflow.
+The regime-adaptive enhancement predicts market regimes and adjusts portfolio exposure accordingly. \Cref{fig:ml-pipeline} illustrates the 6-phase workflow; complete mathematical details are provided in \Cref{app:ml-methodology}.
 
-\begin{figure}[htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.15cm]
     % Phase boxes - two rows
-    \node[phasebox, fill=blue!10, draw=blue!70] (p1) {\textbf{Phase 1}\\HMM Input\\Construction};
-    \node[phasebox, fill=blue!10, draw=blue!70, right=0.4cm of p1] (p2) {\textbf{Phase 2}\\HMM Regime\\Identification};
-    \node[phasebox, fill=orange!10, draw=orange!70, right=0.4cm of p2] (p3) {\textbf{Phase 3}\\Feature\\Engineering};
+    \node[phasebox, fill=white, draw=black] (p1) {\textbf{Phase 1}\\HMM Input\\Construction};
+    \node[phasebox, fill=white, draw=black, right=0.4cm of p1] (p2) {\textbf{Phase 2}\\HMM Regime\\Identification};
+    \node[phasebox, fill=white, draw=black, right=0.4cm of p2] (p3) {\textbf{Phase 3}\\Feature\\Engineering};
     
-    \node[phasebox, fill=purple!10, draw=purple!70, below=0.6cm of p1] (p4) {\textbf{Phase 4}\\Walk-Forward\\XGBoost};
-    \node[phasebox, fill=green!10, draw=green!70, right=0.4cm of p4] (p5) {\textbf{Phase 5}\\Portfolio\\Overlay};
-    \node[phasebox, fill=green!10, draw=green!70, right=0.4cm of p5] (p6) {\textbf{Phase 6}\\Transaction\\Costs};
+    \node[phasebox, fill=white, draw=black, below=0.6cm of p1] (p4) {\textbf{Phase 4}\\Walk-Forward\\XGBoost};
+    \node[phasebox, fill=white, draw=black, right=0.4cm of p4] (p5) {\textbf{Phase 5}\\Portfolio\\Overlay};
+    \node[phasebox, fill=white, draw=black, right=0.4cm of p5] (p6) {\textbf{Phase 6}\\Transaction\\Costs};
     
     % Arrows
     \draw[arrow] (p1) -- (p2);
@@ -273,123 +194,737 @@ The regime-adaptive enhancement follows a 6-phase pipeline that predicts market 
     \draw[arrow] (p5) -- (p6);
     
     % Input/Output annotations
-    \node[above=0.2cm of p1, font=\scriptsize, text=blue!70] {$r_t^{HRP}$, Sentiment};
-    \node[above=0.2cm of p2, font=\scriptsize, text=blue!70] {Bear/Bull labels};
-    \node[above=0.2cm of p3, font=\scriptsize, text=orange!70] {14 predictors};
-    \node[below=0.2cm of p4, font=\scriptsize, text=purple!70] {$P(\text{Bull}_{t+1})$};
-    \node[below=0.2cm of p5, font=\scriptsize, text=green!70] {$L_t = f(P)$};
-    \node[below=0.2cm of p6, font=\scriptsize, text=green!70] {NET returns};
-    
-    % Background groupings
-    \begin{scope}[on background layer]
-        \node[fit=(p1)(p2), rounded corners, draw=blue!30, fill=blue!5, inner sep=0.15cm] {};
-        \node[fit=(p4), rounded corners, draw=purple!30, fill=purple!5, inner sep=0.15cm] {};
-        \node[fit=(p5)(p6), rounded corners, draw=green!30, fill=green!5, inner sep=0.15cm] {};
-    \end{scope}
-    
-    % Legend
-    \node[below=1.2cm of p4, font=\scriptsize] (leg) {
-        \tikz{\node[rectangle, fill=blue!10, draw=blue!70, minimum width=0.4cm, minimum height=0.3cm] {};} Data Prep \quad
-        \tikz{\node[rectangle, fill=orange!10, draw=orange!70, minimum width=0.4cm, minimum height=0.3cm] {};} Features \quad
-        \tikz{\node[rectangle, fill=purple!10, draw=purple!70, minimum width=0.4cm, minimum height=0.3cm] {};} ML Model \quad
-        \tikz{\node[rectangle, fill=green!10, draw=green!70, minimum width=0.4cm, minimum height=0.3cm] {};} Execution
-    };
+    \node[above=0.2cm of p1, font=\scriptsize] {$r_t^{HRP}$, Sentiment};
+    \node[above=0.2cm of p2, font=\scriptsize] {Bear/Bull labels};
+    \node[above=0.2cm of p3, font=\scriptsize] {13 predictors};
+    \node[below=0.2cm of p4, font=\scriptsize] {$P(\text{Bull}_{t+1})$};
+    \node[below=0.2cm of p5, font=\scriptsize] {$L_t = f(P)$};
+    \node[below=0.2cm of p6, font=\scriptsize] {NET returns};
 \end{tikzpicture}
 \caption{Regime-Adaptive Enhancement Pipeline. The 6-phase workflow transforms HRP returns and consumer sentiment into regime labels (Phases 1--2), constructs predictive features (Phase 3), trains an XGBoost model in walk-forward fashion (Phase 4), and applies the predictions to adjust portfolio leverage with transaction costs (Phases 5--6).}
 \label{fig:ml-pipeline}
 \end{figure}
 
-\subsubsection{Phase 1: Data Construction (HMM Input)}
+\subsubsection{Hidden Markov Model for Regime Detection}
 
-A 3-dimensional observation vector is constructed for the HMM using HRP strategy returns and consumer sentiment, as shown in \Cref{fig:hmm-input}:
+A 2-state Gaussian HMM is fitted using three input features: (1) log returns of the HRP strategy, (2) 6-month rolling downside deviation, and (3) year-over-year Michigan Consumer Sentiment change (lagged 1 month for publication delay). All features are expanding Z-scored using only past data to avoid look-ahead bias.
+
+Critically, a \textbf{forward-only filter} is implemented to compute filtered posteriors $P(q_t | O_{1:t})$, avoiding the smoothed posteriors from standard forward-backward inference that would leak future information. States are relabeled by mean return: ``Bear'' (lower mean) and ``Bull'' (higher mean). The HMM is re-estimated every 12 months with an expanding window (minimum 120 months training).
+
+\subsubsection{XGBoost Regime Prediction}
+
+13 predictive features from four categories are constructed to predict the \textit{next month's} regime ($y_t = \text{regime}_{t+1}$):
+\begin{itemize}
+    \item \textbf{Cross-sectional} (4): return dispersion, Amihud illiquidity, BAB momentum, pairwise correlation
+    \item \textbf{Macroeconomic} (5): credit spread, term spread, CPI volatility, M2 growth, unemployment trend
+    \item \textbf{Factor} (1): valuation spread (value vs.\ growth)
+    \item \textbf{Strategy momentum} (3): HRP 1M, 3M, and 12M returns
+\end{itemize}
+All features are rolling Z-scored with ex-ante normalization; complete formulas are in \Cref{app:features}.
+
+XGBoost \cite{chen2016} is trained using a rigorous \textbf{purged-embargoed walk-forward} protocol: a 12-month purge gap separates training from test periods to prevent information leakage from overlapping features, and winsorization bounds are computed inside the walk-forward loop using training data only. Following Gu, Kelly, and Xiu \cite{gu2020}, shallow trees (\texttt{max\_depth}=3) with strong regularization are used, as deeper architectures overfit in low signal-to-noise financial data.
+
+\paragraph{Why HMM $\rightarrow$ XGBoost?}
+The HMM serves as an \textit{unsupervised denoising layer}: it transforms noisy financial time series into persistent regime labels without requiring ex-ante specification of crisis dates. The XGBoost then learns to anticipate when this risk model will signal danger---the operationally relevant objective for defensive portfolio positioning.
+
+\subsubsection{Portfolio Allocation and Transaction Costs}
+
+The regime prediction adjusts HRP exposure via two-fund separation:
 \begin{equation}
-    \mathbf{O}_t = \begin{bmatrix} \text{log\_return}_t^z \\ \text{downside\_dev}_t^z \\ \text{sent\_change}_t^z \end{bmatrix}
+    L_t = P(\text{Bull}_t) \times \frac{1}{\bar{P}(\text{Bull})}
+\end{equation}
+where $L_t > 1$ implies leveraged exposure to HRP (borrowing at $r_f + 50$ bps), and $L_t < 1$ implies defensive allocation to T-Bills. The scaling by $1/\bar{P}(\text{Bull})$ ensures mean leverage equals 1 for fair comparison with buy-and-hold HRP.
+
+All reported HRP returns are \textbf{net of transaction costs} (10 bps per trade), accounting for: (1) within-industry stock rebalancing, (2) across-industry HRP rebalancing, (3) leverage overlay adjustments, and (4) financing spreads when leveraged. This forward-looking cost assumption assesses whether historical market patterns would generate profitable signals with today's trading infrastructure.
+
+%==============================================================================
+% 4. DATA DESCRIPTION
+%==============================================================================
+\section{Data Description}
+\label{sec:data}
+
+\subsection{Data Sources}
+
+This analysis integrates four primary data sources spanning 1960--2024:
+
+\begin{table}[H]
+\centering
+\caption{Data Sources and Coverage}
+\label{tab:data}
+\begin{tabular}{llll}
+\toprule
+Source & Variables & Frequency & Coverage \\
+\midrule
+CRSP & Returns, prices, volume, & Monthly & 1960--2024 \\
+      & shares out., SHRCD, EXCHCD, SICCD & & \\
+Compustat & Book equity (seqq) & Quarterly & 1970--2024 \\
+FRED & BAA, DGS10, TB3MS, CPI, M2, UNRATE & Monthly & 1975--2024 \\
+Univ.\ of Michigan & Consumer Sentiment Index (ICS) & Monthly & 1960--2024 \\
+Fama-French & 12 Industry classifications, RF (1M T-Bill) & Monthly & 1960--2024 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CRSP data undergoes no cleaning or imputation beyond filtering for common stocks (SHRCD 10, 11) and major exchanges (NYSE, NASDAQ, AMEX). Data cleanliness is ensured by construction: the universe filter and complete 60-month lookback requirement exclude stocks with missing observations. Delisting returns are handled as follows: DLRET replaces RET when only DLRET is available; when both exist, $(1+\text{RET})(1+\text{DLRET})-1$ is applied \cite{shumway1997}. Missing returns for held positions are imputed as $-100\%$---a conservative assumption that may understate results. Stocks are mapped to 12 Fama-French industries via SIC codes \cite{fama1997}, then filtered to retain the top 20\% most liquid per industry (see \Cref{app:liquidity}). FRED macroeconomic data is transformed into spreads (credit, term), volatility measures (CPI), and trends (M2 growth, unemployment). All features are rolling Z-scored with 1\%/99\% winsorization bounds computed from training data only.
+
+\begin{table}[H]
+\centering
+\caption{Dataset Statistics}
+\label{tab:stats}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Total months available & 768 (1960--2024) \\
+HRP backtest months & 624 (1972--2024) \\
+ML prediction months & 438 (1988--2024) \\
+Minimum training period & 120 months \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+% 5. IMPLEMENTATION
+%==============================================================================
+\section{Implementation}
+\label{sec:implementation}
+
+The implementation follows a modular Python design with 7 specialized modules handling data loading, HRP computation, HMM regime detection, feature engineering, XGBoost training, and transaction cost accounting. Several components are GPU-accelerated via CuPy/CUDA (covariance and correlation matrices, distance computations, turnover calculations, value-weighted industry ETF aggregation) and XGBoost CUDA, though with only $N=12$ industry ETFs the computational gains are modest. The walk-forward prediction framework implements strict look-ahead bias controls: winsorization bounds are computed using training data only, and XGBoost uses fixed hyperparameters to avoid in-sample overfitting.
+
+The complete module architecture, GPU algorithms, and hyperparameter configuration are provided in \Cref{app:implementation}.
+
+%==============================================================================
+% 6. RESULTS
+%==============================================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{HMM Regime Detection}
+
+The 2-state, 3-feature HMM successfully identifies distinct market regimes characterized by volatility patterns. The addition of Michigan Consumer Sentiment as a third input feature improves regime differentiation:
+
+\begin{table}[H]
+\centering
+\caption{HMM Regime Characteristics (1977--2024)}
+\label{tab:hmm}
+\begin{tabular}{lrrrr}
+\toprule
+Regime & Months & Proportion & Ann. Return & Ann. Vol \\
+\midrule
+Bear & 138 & 24.7\% & $+2.5\%$ & 20.3\% \\
+Bull & 421 & 75.3\% & $+14.5\%$ & 13.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The transition matrix shows strong regime persistence:
+\begin{equation}
+    \mathbf{P} = \begin{bmatrix} P(\text{Bear}|\text{Bear}) & P(\text{Bull}|\text{Bear}) \\ P(\text{Bear}|\text{Bull}) & P(\text{Bull}|\text{Bull}) \end{bmatrix} \approx \begin{bmatrix} 0.88 & 0.12 \\ 0.04 & 0.96 \end{bmatrix}
 \end{equation}
 
-\begin{figure}[htbp]
+The expected duration is 8.6 months for bear regimes and 24.8 months for bull regimes. Note that this HMM analysis begins in 1977 due to Michigan Consumer Sentiment data availability, and is not exactly aligned with the XGBoost prediction period (1988--2024). \Cref{fig:hmm-regimes} in Appendix~\ref{app:hmm-features} visualizes the regime detection results, showing HRP returns with bear regime shading, filtered probabilities, and downside deviation by regime.
+
+\subsection{XGBoost Prediction Performance}
+
+The walk-forward XGBoost achieves 76.5\% accuracy and ROC-AUC of 0.806 over 438 out-of-sample months (1988--2024). The model exhibits balanced recall: 54.5\% for bear months and 83.8\% for bull months, with a critical \textbf{false bear rate of only 16.2\%}---avoiding costly whipsaw trades during bull markets. Full metrics are reported in \Cref{tab:xgb} (Appendix~\ref{app:hmm-features}).
+
+\Cref{fig:xgb-analysis} in Appendix~\ref{app:hmm-features} provides detailed visualization of the XGBoost model performance, including ROC curve, prediction probability distribution, accuracy over time, and feature importance. The prediction accuracy remains stable across most periods, with notable degradation only during 2000--2005 when the Dot-com bubble collapse created regime transitions that were difficult to anticipate.
+
+\begin{figure}[H]
 \centering
-\begin{tikzpicture}[
-    inputbox/.style={rectangle, rounded corners, draw=black!70, minimum width=2.8cm, minimum height=0.8cm, font=\small, text centered},
-    transformbox/.style={rectangle, rounded corners, draw=orange!70, fill=orange!10, minimum width=2cm, minimum height=0.7cm, font=\scriptsize, text centered},
-    outputbox/.style={rectangle, rounded corners, draw=blue!70, fill=blue!20, minimum width=2cm, minimum height=0.7cm, font=\scriptsize, text centered},
-]
-
-% Input data sources
-\node[inputbox, fill=gray!15] (hrp) at (0, 2.5) {HRP Returns\\$r_t^{HRP}$};
-\node[inputbox, fill=gray!15] (ics) at (0, 0) {Michigan ICS\\$ICS_t$};
-
-% Transformations
-\node[transformbox] (log) at (3.5, 3) {$\ln(1+r_t)$};
-\node[transformbox] (dd) at (3.5, 2) {Rolling 6M\\Downside Std};
-\node[transformbox] (yoy) at (3.5, 0) {YoY Change\\+ Lag 1M};
-
-% Z-score
-\node[transformbox, fill=purple!10, draw=purple!70, minimum width=2.2cm] (zscore) at (6.5, 1.5) {Expanding\\Z-Score};
-
-% Output
-\node[outputbox, minimum height=1.5cm, minimum width=2.5cm] (obs) at (9.5, 1.5) {\textbf{HMM Input}\\$\mathbf{O}_t \in \mathbb{R}^3$};
-
-% Arrows from inputs
-\draw[->, thick] (hrp.east) -- ++(0.5,0) |- (log.west);
-\draw[->, thick] (hrp.east) -- ++(0.5,0) |- (dd.west);
-\draw[->, thick] (ics.east) -- (yoy.west);
-
-% Arrows to z-score
-\draw[->, thick] (log.east) -- ++(0.5,0) |- (zscore.west);
-\draw[->, thick] (dd.east) -- (zscore.west);
-\draw[->, thick] (yoy.east) -- ++(0.5,0) |- (zscore.west);
-
-% Arrow to output
-\draw[->, thick] (zscore.east) -- (obs.west);
-
-% Feature labels
-\node[right, font=\scriptsize, text=blue!70] at (9.5, 2.3) {log\_return$^z$};
-\node[right, font=\scriptsize, text=blue!70] at (9.5, 1.5) {downside\_dev$^z$};
-\node[right, font=\scriptsize, text=blue!70] at (9.5, 0.7) {sent\_change$^z$};
-
-\end{tikzpicture}
-\caption{HMM Input Construction. Three features are derived from HRP returns and Michigan Consumer Sentiment: (1) log returns capture momentum, (2) 6-month rolling downside deviation captures left-tail risk, and (3) YoY sentiment change captures consumer confidence shifts. All features are standardized using expanding Z-scores computed from past data only.}
-\label{fig:hmm-input}
+\includegraphics[width=0.85\textwidth]{figures/PBull_Bear_regimes.png}
+\caption{Predicted P(Bull) probability over time with actual bear regimes shaded. The walk-forward framework produces increasingly confident predictions as training data accumulates: early predictions (1988--2004) exhibit substantial uncertainty, while post-2004 predictions become notably more polarized. The model successfully identifies major market stress episodes including the 2008 GFC, 2020 COVID crash, and 2022 rate hikes with high confidence.}
+\label{fig:pbull-regimes}
 \end{figure}
 
-\paragraph{Log Returns.} $\text{log\_return}_t = \ln(1 + r_t^{HRP})$
+\Cref{fig:pbull-regimes} illustrates the evolution of P(Bull) predictions over the out-of-sample period. The model exhibits a clear learning effect as the walk-forward cross-validation progresses: early predictions cluster between 0.5 and 0.8 (approx.) with substantial uncertainty, while post-2004 predictions become increasingly polarized toward 0 or 1. This growing confidence reflects the expanding training set and the model's improved ability to distinguish regime characteristics. Notably, the framework correctly anticipates most major market downturns in the latter period, reducing exposure before significant drawdowns materialize.
+
+\paragraph{Feature Importance.}
+Averaged across all walk-forward refits, the most important features (by gain) are:
+\begin{enumerate}
+    \item \texttt{avg\_pairwise\_corr\_z}: Average pairwise correlation (gain: 0.66)
+    \item \texttt{unrate\_trend}: Unemployment rate trend (gain: 0.40)
+    \item \texttt{amihud\_z}: Amihud illiquidity (gain: 0.38)
+    \item \texttt{hrp\_mom\_12m\_z}: 12-month HRP momentum (gain: 0.34)
+    \item \texttt{term\_spread}: Term spread (gain: 0.22)
+\end{enumerate}
+
+The dominance of \texttt{avg\_pairwise\_corr\_z} indicates that correlation structure---a direct measure of diversification effectiveness---is the strongest regime signal. When correlations spike, diversification fails and bear markets become more likely. Macroeconomic features (\texttt{unrate\_trend}, \texttt{term\_spread}) and market microstructure (\texttt{amihud\_z}) complement the cross-sectional signals, while strategy momentum (\texttt{hrp\_mom\_12m\_z}) captures regime persistence. The confusion matrix is provided in \Cref{tab:confusion} (Appendix~\ref{app:hmm-features}).
+
+\subsection{Portfolio Performance}
+
+\begin{table}[H]
+\centering
+\caption{Strategy Performance Comparison (1988--2024). HRP strategies are net of transaction costs; CRSP VW shown gross for comparison.}
+\label{tab:perf}
+\begin{tabular}{lrrrr}
+\toprule
+Strategy & Ann. Return & Ann. Vol & Sharpe & Max DD \\
+\midrule
+CRSP VW Index (gross) & 11.4\% & 15.6\% & 0.54 & $-51.5\%$ \\
+Buy \& Hold HRP (net) & 10.1\% & 13.0\% & 0.56 & $-47.1\%$ \\
+P(Bull) Scaled (net) & 13.1\% & 11.3\% & 0.85 & $-25.2\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The P(Bull)-scaled strategy improves Sharpe ratio by 52\% over static HRP (0.85 vs 0.56) while reducing maximum drawdown by 46\% (25.2\% vs 47.1\%). This outperformance is consistent across subperiods, maintaining positive Sharpe ratios throughout varying market conditions---see \Cref{fig:subsample-sharpe,fig:subsample-equity} in Appendix~\ref{app:drawdown-analysis}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phase5_gross_vs_net_equity.png}
+\caption{Cumulative returns comparison on both linear and log scales. The P(Bull)-scaled strategy reduces exposure during high-volatility regimes, resulting in significantly smaller drawdowns (25.2\% vs 47.1\% for HRP) while achieving superior long-term returns.}
+\label{fig:equity-curves}
+\end{figure}
+
+\subsection{Drawdown Analysis}
+\label{sec:drawdown}
+
+Drawdowns capture the asymmetric, path-dependent nature of investment risk that variance-based measures overlook. \Cref{tab:drawdowns} presents the five largest drawdowns for each strategy:
+
+\begin{table}[H]
+\centering
+\caption{Top Five Drawdowns by Strategy (1988--2024)}
+\label{tab:drawdowns}
+\begin{tabular}{lrrrrr}
+\toprule
+Strategy & DD1 & DD2 & DD3 & DD4 & DD5 \\
+\midrule
+Buy \& Hold HRP & $-$47.1\% & $-$29.3\% & $-$25.1\% & $-$22.5\% & $-$22.3\% \\
+P(Bull) Scaled & $-$25.2\% & $-$17.8\% & $-$15.8\% & $-$14.6\% & $-$13.5\% \\
+CRSP VW Index & $-$51.5\% & $-$31.4\% & $-$26.3\% & $-$17.8\% & $-$16.6\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The regime-adaptive strategy's worst drawdown ($-$25.2\%, occurring during the Dot-com bust from 2000-12 to 2002-08) is roughly half of HRP's ($-$47.1\%) and the market's ($-$51.5\%), with all four secondary drawdowns ($-$17.8\%, $-$15.8\%, $-$14.6\%, $-$13.5\%) smaller than HRP's \textit{fifth} worst ($-$22.3\%). During the Global Financial Crisis, while HRP suffered a $-$47.1\% drawdown (2007--2009), the regime-adaptive strategy limited losses to $-$6.6\%---an 86\% reduction. This difference has practical implications: a 25\% drawdown requires only a 33\% gain to recover, versus 89\% for a 47\% drawdown.
+
+The P(Bull) Scaled strategy occasionally experiences larger drawdowns than static HRP---notably during 2022 (up to $-$3.4\% excess) and early 2016---when the model maintained bull allocations amid short-term volatility. However, these episodes are minor compared to the 86\% GFC protection and consistent tail risk reduction across all major crises.
+
+\subsection{Transaction Cost Impact}
+
+All reported HRP returns assume 10 bps per trade and 50 bps financing spread above the risk-free rate, reflecting current institutional costs rather than historical conditions.
+
+\begin{table}[H]
+\centering
+\caption{Gross vs. Net Performance (10 bps Transaction Cost + 50 bps Financing Spread)}
+\label{tab:txcost}
+\begin{tabular}{lrrr}
+\toprule
+Strategy & Gross Sharpe & Net Sharpe & Sharpe Drag \\
+\midrule
+Buy \& Hold HRP & 0.58 & 0.56 & 0.02 \\
+P(Bull) Scaled & 0.91 & 0.85 & 0.06 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Transaction costs reduce Sharpe ratios by only 0.02--0.06, demonstrating practical implementability despite monthly rebalancing and leverage adjustments.
+
+%==============================================================================
+% 7. CONCLUSION
+%==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper demonstrates that combining Hierarchical Risk Parity with machine learning-based regime prediction yields economically meaningful improvements in portfolio performance. The contributions include:
+
+\begin{enumerate}
+    \item A two-stage HRP framework that aggregates stocks into 12 Fama-French industry ETFs, ensuring stable covariance estimation ($N=12 < T=60$) without requiring shrinkage estimators
+    \item A 3-feature forward-only HMM filter (log returns, downside deviation, Michigan Consumer Sentiment) that identifies bull and bear regimes without look-ahead bias
+    \item An XGBoost regime prediction system with proper walk-forward validation and purged cross-validation
+    \item A complete transaction cost framework with asymmetric financing demonstrating practical implementability
+\end{enumerate}
+
+While the regime-adaptive strategy achieves a net Sharpe ratio of 0.85---a 57\% improvement over the CRSP value-weighted index (0.54) and 52\% over static HRP (0.56)---it is emphasized that \textbf{the reduction in drawdowns is the primary achievement}. Academic finance has long conflated volatility with risk, but practitioners know that drawdowns destroy wealth and investor confidence in ways that symmetric volatility does not. The strategy's worst drawdown ($-$25.2\%) is roughly half of static HRP's ($-$47.1\%), and the four smaller drawdowns are all below HRP's fifth worst ($-$22.3\%). This is not merely risk reduction---it is the difference between an investable strategy and a theoretical construct.
+
+\subsection{Limitations}
+
+Several limitations warrant mention:
+\begin{itemize}
+    \item \textbf{Model-generated targets}: The XGBoost predicts HMM-inferred labels, not directly observable economic states. However, this approach helps denoise market regimes and produces strong empirical results, suggesting it may be more relevant than using raw observable signals. Future work could validate against alternative regime definitions (NBER recession dates, VIX regimes, or realized volatility thresholds)
+    \item The 2-state HMM identifies volatility regimes rather than directional market moves; both regimes have positive expected returns
+    \item While 76.5\% accuracy is adequate, the 54.5\% recall on bear predictions means some high-volatility periods are missed---the strategy balances precision and recall
+    \item Results are sensitive to the 60-month lookback window for covariance estimation; shorter windows increase noise
+    \item The strategy's outperformance may partially reflect the specific sample period (1988--2024)
+    \item A significant portion of the features used in the HMM and ML prediction models lack data before approximately 1975, which is why out-of-sample testing could not begin earlier than 1988
+    \item \textbf{Overfitting risk}: Despite strict walk-forward protocols and purged cross-validation, projects of this nature carry inherent risk of unintentional overfitting through repeated researcher decisions on feature selection, model architecture, and hyperparameter choices
+\end{itemize}
+
+\subsection{Future Work}
+
+Promising extensions include:
+\begin{itemize}
+    \item \textbf{Daily data}: Using daily returns would enable applying HRP directly to individual stocks (rather than industry aggregates) and refining features such as downside deviation with higher-frequency observations
+    \item \textbf{Live validation}: Deploying the strategy with a paper trading account to validate real-world execution, slippage, and model degradation over time
+    \item \textbf{Alternative defensive allocation}: Replacing the risk-free rate with a quantitative strategy that benefits from market crashes (e.g., tail-risk hedging, volatility carry) to maximize Sharpe ratio during bear regimes
+    \item Incorporating alternative data (sentiment, options-implied volatility) as additional features
+    \item Exploring 3-state HMMs to capture consolidation/transition regimes
+    \item Applying deep learning (LSTM/Transformer) for regime sequence modeling
+    \item Extending to international markets for diversification benefits
+\end{itemize}
+
+%==============================================================================
+% APPENDIX
+%==============================================================================
+\appendix
+\section{AI Tools and External Resources}
+\label{app:ai}
+
+The following AI tools and external resources were used in this project:
+
+\paragraph{AI Assistants:}
+\begin{itemize}
+    \item \textbf{GitHub Copilot} (Claude Opus 4.5): Code generation assistance, debugging, and documentation writing
+    \item Usage: Interactive coding sessions for implementing HRP algorithms, feature engineering, and visualization code
+\end{itemize}
+
+\paragraph{Libraries and Frameworks:}
+\begin{itemize}
+    \item \texttt{CuPy}: GPU-accelerated array operations (BSD License)
+    \item \texttt{hmmlearn}: Hidden Markov Model implementation (BSD License)
+    \item \texttt{XGBoost}: Gradient boosting (Apache 2.0 License)
+    \item \texttt{scipy.cluster.hierarchy}: Hierarchical clustering
+    \item \texttt{scikit-learn}: Cross-validation and metrics
+\end{itemize}
+
+\paragraph{Data Sources:}
+\begin{itemize}
+    \item CRSP (Center for Research in Security Prices): Licensed academic access
+    \item Compustat: Licensed academic access via WRDS
+    \item FRED (Federal Reserve Economic Data): Public domain
+    \item Kenneth French Data Library: Public academic resource
+\end{itemize}
+
+\paragraph{Reference Implementations:}
+\begin{itemize}
+    \item López de Prado's HRP algorithm adapted from \cite{lopez2016}
+    \item Two-stage industry aggregation inspired by Fama-French 12 industry classification \cite{fama1997}
+    \item Purged cross-validation inspired by \cite{prado2018}
+\end{itemize}
+
+\section{Reproducibility}
+\label{app:reproduce}
+
+The complete codebase is available at the accompanying GitHub repository. To reproduce results:
+
+\begin{enumerate}
+    \item Install dependencies: \texttt{pip install -r requirements.txt}
+    \item Place data files in \texttt{DATA/} directory structure
+    \item Configure parameters in \texttt{config.yaml}
+    \item Run the Jupyter notebook: \texttt{CUDA-HRP-MULTIVAR-ML-V3.ipynb}
+\end{enumerate}
+
+Computation time on NVIDIA RTX GPU: approximately 2 minutes for full backtest (588 months).
+
+\section{HRP Algorithm Details}
+\label{app:hrp}
+
+The HRP weight computation follows a 7-stage pipeline executed at each monthly rebalancing date.
+
+\subsection*{Stage 1: Return Extraction}
+For each rebalancing date $t$, a 60-month ($T=60$) lookback window of returns is extracted for stocks passing the universe filter. Only stocks with all 60 monthly returns available are included:
+\begin{equation}
+    \mathbf{R}_{t} \in \mathbb{R}^{T \times N}, \quad \text{where } R_{s,i} = r_{i,s} \text{ for } s \in [t-59, t]
+\end{equation}
+
+\subsection*{Stage 2: Sample Covariance Estimation}
+With $N = 12$ industries and $T = 60$, the sample covariance is full-rank:
+\begin{equation}
+    \hat{\boldsymbol{\Sigma}} = \frac{1}{T-1} \sum_{t=1}^{T} (\mathbf{r}_t - \bar{\mathbf{r}})(\mathbf{r}_t - \bar{\mathbf{r}})^\top \in \mathbb{R}^{12 \times 12}
+\end{equation}
+
+\subsection*{Stage 3: Distance Matrix Construction}
+The sample correlation matrix is converted to a distance matrix using a two-step process following L\'opez de Prado \cite{lopez2016}:
+
+\paragraph{Step 3a: Correlation Distance.}
+\begin{equation}
+    d_{i,j} = \sqrt{\frac{1}{2}(1 - \rho_{i,j})} \in [0, 1]
+\end{equation}
+This maps perfect correlation ($\rho=1$) to zero distance and perfect anti-correlation ($\rho=-1$) to maximum distance.
+
+\paragraph{Step 3b: Euclidean Distance on Correlation Profiles.}
+\begin{equation}
+    \tilde{d}_{i,j} = \sqrt{\sum_{k=1}^{N} (d_{k,i} - d_{k,j})^2}
+\end{equation}
+This captures how similarly two assets correlate with the entire universe.
+
+\subsection*{Stage 4: Hierarchical Clustering}
+Single linkage clustering \cite{sneath1973} performs agglomerative clustering:
+\begin{equation}
+    D(A, B) = \min_{i \in A, j \in B} d(i, j)
+\end{equation}
+The output is a dendrogram representing the hierarchical structure of asset similarities.
+
+\begin{figure}[H]
+    \centering
+    \fbox{\parbox{0.85\textwidth}{\centering\vspace{3cm}
+    \textbf{Figure: Industry HRP Dendrogram (December 2023)}\\[1em]
+    Single linkage clustering of 12 Fama-French industries based on correlation distance.\\
+    Adjacent industries in the quasi-diagonalized ordering exhibit higher return correlations.
+    \vspace{3cm}}}
+    \caption{Industry HRP dendrogram (December 2023). Single linkage clustering groups the 12 Fama-French industries based on correlation distance. Adjacent industries in the quasi-diagonalized ordering exhibit higher return correlations.}
+    \label{fig:dendrogram}
+\end{figure}
+
+\subsection*{Stage 5: Quasi-Diagonalization (Seriation)}
+The dendrogram is reordered so that similar assets are placed adjacent, producing a quasi-diagonal covariance matrix.
+
+\subsection*{Stage 6: Recursive Bisection}
+Weights are allocated through top-down recursive bisection. At each node splitting cluster $C$ into $C_1$ and $C_2$:
+\begin{equation}
+    \alpha = 1 - \frac{\tilde{V}_{C_1}}{\tilde{V}_{C_1} + \tilde{V}_{C_2}}, \quad w_{C_1} = \alpha \cdot w_C, \quad w_{C_2} = (1-\alpha) \cdot w_C
+\end{equation}
+where $\tilde{V}_C$ is the cluster variance computed as an inverse-variance portfolio:
+\begin{equation}
+    \tilde{V}_C = \left( \sum_{i \in C} \frac{1}{\sigma_i^2} \right)^{-1} \cdot \mathbf{1}^\top \boldsymbol{\Sigma}_C^{-1} \mathbf{1}
+\end{equation}
+
+\section{Implementation Details}
+\label{app:implementation}
+
+\subsection*{Module Architecture}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+Module & Responsibility \\
+\midrule
+\texttt{hrp\_data.py} & Data loading, filtering, universe construction \\
+\texttt{hrp\_functions.py} & HRP weight computation, covariance estimation, clustering \\
+\texttt{hrp\_pipeline.py} & HRP orchestration, backtesting \\
+\texttt{hrp\_hmm.py} & HMM regime detection, forward filter \\
+\texttt{hrp\_features.py} & Feature engineering, Z-scoring \\
+\texttt{hrp\_ml.py} & XGBoost training, walk-forward prediction \\
+\texttt{hrp\_strategy.py} & Portfolio overlay, transaction costs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{Key Configuration Parameters}
+
+\begin{table}[H]
+\centering
+\caption{Hyperparameter Configuration}
+\label{tab:config-summary}
+\begin{tabular}{lll}
+\toprule
+Component & Parameter & Value \\
+\midrule
+HRP & Lookback window & 60 months \\
+HRP & Rebalancing frequency & Monthly \\
+HRP & Clustering method & Single linkage \\
+HMM & Number of states & 2 (Bull/Bear) \\
+HMM & Input features & 3 (log returns, DD, sentiment) \\
+HMM & Minimum training window & 120 months \\
+HMM & Refit frequency & 12 months \\
+HMM & Downside deviation window & 6 months \\
+XGBoost & Minimum training window & 120 months \\
+XGBoost & Purge gap & 12 months \\
+XGBoost & Embargo fraction & 1\% \\
+XGBoost & \texttt{max\_depth} & 3 \\
+XGBoost & \texttt{learning\_rate} & 0.05 \\
+XGBoost & \texttt{n\_estimators} & 500 \\
+XGBoost & \texttt{subsample} & 0.8 \\
+XGBoost & \texttt{reg\_alpha} / \texttt{reg\_lambda} & 2.0 / 5.0 \\
+Costs & Transaction cost & 10 bps per leg \\
+Costs & Financing spread & 50 bps annually \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{GPU-Accelerated Algorithms}
+
+The implementation leverages GPU acceleration via CuPy (CUDA) and cuDF (RAPIDS) for computationally intensive operations. All GPU functions include automatic CPU fallback when CUDA is unavailable.
+
+\begin{algorithm}[H]
+\caption{GPU-Accelerated Covariance and Correlation (CuPy)}
+\label{alg:gpu-cov}
+\begin{algorithmic}
+\REQUIRE Industry ETF returns matrix $\mathbf{R} \in \mathbb{R}^{T \times N}$, $N=12$, $T=60$
+\STATE Transfer $\mathbf{R}$ to GPU memory via \texttt{cp.asarray()}
+\STATE $\bar{\mathbf{r}} \gets \frac{1}{T}\sum_{t=1}^{T} \mathbf{r}_t$ \COMMENT{GPU vectorized mean}
+\STATE $\hat{\boldsymbol{\Sigma}} \gets \frac{1}{T-1}(\mathbf{R} - \bar{\mathbf{r}})^\top(\mathbf{R} - \bar{\mathbf{r}})$ \COMMENT{cuBLAS matrix multiply}
+\STATE $\boldsymbol{\sigma} \gets \sqrt{\text{diag}(\hat{\boldsymbol{\Sigma}})}$ \COMMENT{Standard deviations}
+\STATE $\hat{\boldsymbol{\rho}} \gets \hat{\boldsymbol{\Sigma}} \oslash (\boldsymbol{\sigma} \boldsymbol{\sigma}^\top)$ \COMMENT{Element-wise division}
+\STATE $\hat{\boldsymbol{\rho}} \gets \text{clip}(\hat{\boldsymbol{\rho}}, -1, 1)$ \COMMENT{Numerical stability}
+\RETURN $\hat{\boldsymbol{\Sigma}}$, $\hat{\boldsymbol{\rho}}$ transferred to CPU
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{GPU-Accelerated Distance Matrices (CuPy)}
+\label{alg:gpu-dist}
+\begin{algorithmic}
+\REQUIRE Correlation matrix $\hat{\boldsymbol{\rho}} \in \mathbb{R}^{N \times N}$
+\STATE Transfer $\hat{\boldsymbol{\rho}}$ to GPU
+\STATE $\mathbf{D}^{corr}_{i,j} \gets \sqrt{(1 - \hat{\rho}_{i,j})/2}$ \COMMENT{Correlation distance, vectorized}
+\STATE $\mathbf{s}_i \gets \sum_k (D^{corr}_{k,i})^2$ \COMMENT{Squared norms}
+\STATE $\mathbf{D}^{eucl} \gets \sqrt{\mathbf{s} + \mathbf{s}^\top - 2\mathbf{D}^{corr}(\mathbf{D}^{corr})^\top}$ \COMMENT{Euclidean distance}
+\RETURN $\mathbf{D}^{eucl}$ transferred to CPU for SciPy clustering
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{GPU-Accelerated Drift-Adjusted Turnover (CuPy)}
+\label{alg:gpu-turnover}
+\begin{algorithmic}
+\REQUIRE Target weights $\mathbf{W} \in \mathbb{R}^{T \times N}$, returns $\mathbf{R} \in \mathbb{R}^{T \times N}$, portfolio returns $\mathbf{r}^p \in \mathbb{R}^{T}$
+\STATE Transfer $\mathbf{W}$, $\mathbf{R}$, $\mathbf{r}^p$ to GPU
+\STATE $\tau_1 \gets \|\mathbf{W}_1\|_1$ \COMMENT{Initial investment}
+\FOR{$t = 2$ to $T$ (vectorized)}
+    \STATE $\mathbf{W}^{drift}_{t} \gets \mathbf{W}_{t-1} \odot (1 + \mathbf{R}_t) / (1 + r^p_t)$ \COMMENT{Drift due to returns}
+    \STATE $\tau_t \gets \|\mathbf{W}_t - \mathbf{W}^{drift}_t\|_1$ \COMMENT{L1 distance}
+\ENDFOR
+\RETURN $\boldsymbol{\tau}$ transferred to CPU
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{GPU-Accelerated Value-Weighted Industry ETF Returns (cuDF)}
+\label{alg:gpu-etf}
+\begin{algorithmic}
+\REQUIRE Stock-level data: returns $r_{i,t}$, lagged market cap $M_{i,t-1}$, industry $k_i$
+\STATE Transfer DataFrame to GPU via \texttt{cudf.DataFrame.from\_pandas()}
+\STATE $M^{ind}_{k,t} \gets \sum_{i \in k} M_{i,t-1}$ \COMMENT{\texttt{groupby(['DATE','FF\_12']).transform('sum')}}
+\STATE $w_{i,t} \gets M_{i,t-1} / M^{ind}_{k_i,t}$ \COMMENT{Value weights within industry}
+\STATE $r^{ind}_{k,t} \gets \sum_{i \in k} w_{i,t} \cdot r_{i,t}$ \COMMENT{\texttt{groupby().sum()} on GPU}
+\RETURN Industry returns $\mathbf{R}^{ind} \in \mathbb{R}^{T \times 12}$ transferred to CPU
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{XGBoost CUDA Acceleration.} When a CUDA-capable GPU is detected, XGBoost training uses \texttt{device='cuda'} with \texttt{tree\_method='hist'} for GPU-accelerated histogram-based gradient boosting. The implementation verifies actual GPU execution by inspecting the model configuration post-training, falling back to CPU if silent fallback is detected.
+
+\subsection*{Walk-Forward Safeguards}
+
+The walk-forward prediction implements strict look-ahead bias controls:
+\begin{enumerate}
+    \item \textbf{Winsorization}: Bounds computed from training data only, then applied to test data
+    \item \textbf{Fixed Hyperparameters}: XGBoost uses pre-specified parameters to avoid in-sample optimization
+    \item \textbf{HMM Training}: Expanding window with forward-only filtering
+\end{enumerate}
+
+\subsection*{Full Configuration}
+
+\begin{verbatim}
+data:
+  window: 60          # Lookback for covariance
+  rebalance_freq: 1M  # Monthly rebalancing
+  
+hmm:
+  min_train: 120      # Minimum HMM training months
+  refit_freq: 12      # HMM refit frequency
+  downside_window: 6  # Downside deviation window
+
+ml:
+  min_train_months: 120
+  purge_gap: 12
+  embargo_pct: 0.01
+  fixed_params:
+    max_depth: 3
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 2.0
+    reg_lambda: 5.0
+    n_estimators: 500
+
+strategy:
+  tx_cost_bps: 10
+  financing_spread_bps: 50
+\end{verbatim}
+
+\subsection*{Walk-Forward Backtesting}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    trainblock/.style={rectangle, draw=black, fill=white, minimum height=0.5cm, font=\scriptsize},
+    purgeblock/.style={rectangle, draw=black, pattern=north east lines, minimum height=0.5cm, font=\scriptsize},
+    embargoblock/.style={rectangle, draw=black, fill=black, minimum height=0.5cm, font=\scriptsize},
+    testblock/.style={rectangle, draw=black, fill=black!30, minimum height=0.5cm, font=\scriptsize},
+]
+
+% Time axis
+\draw[->, thick] (0, 0) -- (12, 0) node[right] {\scriptsize Time};
+
+% Year labels
+\foreach \x/\label in {0/0, 2/Yr5, 4/Yr10, 6/Yr15, 8/Yr20, 10/Yr25} {
+    \draw (\x, -0.1) -- (\x, 0.1);
+    \node[below, font=\scriptsize] at (\x, -0.1) {\label};
+}
+
+% Refit 1: Year 10
+\node[trainblock, minimum width=4cm, anchor=west] at (0, 1.2) {};
+\node[purgeblock, minimum width=0.4cm, anchor=west] at (4, 1.2) {};
+\node[embargoblock, minimum width=0.2cm, anchor=west] at (4.4, 1.2) {};
+\node[testblock, minimum width=0.8cm, anchor=west] at (4.6, 1.2) {};
+\node[left, font=\scriptsize] at (0, 1.2) {Refit 1};
+
+% Refit 2: Year 11
+\node[trainblock, minimum width=4.8cm, anchor=west] at (0, 2) {};
+\node[purgeblock, minimum width=0.4cm, anchor=west] at (4.8, 2) {};
+\node[embargoblock, minimum width=0.2cm, anchor=west] at (5.2, 2) {};
+\node[testblock, minimum width=0.8cm, anchor=west] at (5.4, 2) {};
+\node[left, font=\scriptsize] at (0, 2) {Refit 2};
+
+% Refit 3: Year 12
+\node[trainblock, minimum width=5.6cm, anchor=west] at (0, 2.8) {};
+\node[purgeblock, minimum width=0.4cm, anchor=west] at (5.6, 2.8) {};
+\node[embargoblock, minimum width=0.2cm, anchor=west] at (6.0, 2.8) {};
+\node[testblock, minimum width=0.8cm, anchor=west] at (6.2, 2.8) {};
+\node[left, font=\scriptsize] at (0, 2.8) {Refit 3};
+
+% Refit N
+\node[font=\scriptsize] at (0.5, 3.4) {$\vdots$};
+\node[trainblock, minimum width=8cm, anchor=west] at (0, 4) {};
+\node[purgeblock, minimum width=0.4cm, anchor=west] at (8, 4) {};
+\node[embargoblock, minimum width=0.2cm, anchor=west] at (8.4, 4) {};
+\node[testblock, minimum width=0.8cm, anchor=west] at (8.6, 4) {};
+\node[left, font=\scriptsize] at (0, 4) {Refit $N$};
+
+% Legend (positioned higher to avoid axis overlap)
+\node[trainblock, minimum width=0.6cm] at (9.5, 2.4) {};
+\node[right, font=\scriptsize] at (9.8, 2.4) {Train};
+\node[purgeblock, minimum width=0.6cm] at (9.5, 1.8) {};
+\node[right, font=\scriptsize] at (9.8, 1.8) {Purge (12M)};
+\node[embargoblock, minimum width=0.6cm] at (9.5, 1.2) {};
+\node[right, font=\scriptsize] at (9.8, 1.2) {Embargo (1\% of test)};
+\node[testblock, minimum width=0.6cm] at (9.5, 0.6) {};
+\node[right, font=\scriptsize] at (9.8, 0.6) {Test (OOS)};
+
+% Annotations
+\draw[decorate, decoration={brace, amplitude=5pt, raise=2pt}] (0, 1.5) -- (4, 1.5) 
+    node[midway, above=8pt, font=\scriptsize] {Min 120 months};
+
+\end{tikzpicture}
+\caption{Walk-Forward Backtesting with Purged-Embargoed Cross-Validation. The training window expands over time (white), with a 12-month purge gap (hatched) and 1\% of test data embargo (black) separating training from out-of-sample test periods (gray).}
+\label{fig:walk-forward}
+\end{figure}
+
+\section{HMM Feature Formulas}
+\label{app:hmm-features}
+
+This appendix provides the exact formulas for the 3-dimensional HMM observation vector.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phase2_hmm_regimes.png}
+\caption{HMM regime detection using forward-only filtered probabilities. Top: HRP returns with bear regimes shaded in red, showing successful identification of major drawdown periods (2000--2002, 2008--2009, 2020, 2022). Middle: $P(\text{Bull})$ probability time series used for allocation decisions. Bottom: Downside deviation confirms elevated tail risk during bear regimes.}
+\label{fig:hmm-regimes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/phase3_xgb_analysis(1).png}
+\caption{XGBoost model diagnostics. Top-left: ROC curve demonstrates strong discriminative ability (AUC = 0.806). Top-right: P(Bull) distribution shows clear separation between actual bear and bull periods. Bottom-left: Rolling prediction accuracy is stable ($\sim$75--80\%) except during 2000--2005 when the Dot-com bubble collapse created abrupt regime transitions. Bottom-right: Average pairwise correlation dominates feature importance, confirming that correlation breakdown is the primary bear market signal.}
+\label{fig:xgb-analysis}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Regime Prediction Metrics (Out-of-Sample, 1988--2024)}
+\label{tab:xgb}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Accuracy & 76.5\% \\
+ROC-AUC & 0.806 \\
+Bear Precision & 53.1\% \\
+Bull Precision & 84.6\% \\
+Bear Recall & 54.5\% \\
+Bull Recall & 83.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Confusion Matrix (Out-of-Sample Predictions, 1988--2024)}
+\label{tab:confusion}
+\begin{tabular}{lcc}
+\toprule
+& Predicted Bear & Predicted Bull \\
+\midrule
+Actual Bear (99 months) & 54 (54.5\%) & 45 (45.5\%) \\
+Actual Bull (339 months) & 55 (16.2\%) & 284 (83.8\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Log Returns.}
+\begin{equation}
+    \text{log\_return}_t = \ln(1 + r_t^{HRP})
+\end{equation}
 
 \paragraph{Rolling Downside Deviation.} Computed over a 6-month window, capturing left-tail risk:
 \begin{equation}
     \text{DD}_t = \sqrt{\frac{1}{n} \sum_{s=t-5}^{t} \min(r_s, 0)^2}
 \end{equation}
-Only negative returns contribute to downside deviation. The 6-month window provides sufficient responsiveness to regime shifts while maintaining statistical stability.
+Only negative returns contribute to downside deviation.
 
-\paragraph{Michigan Consumer Sentiment Change.} Year-over-year percentage change in the University of Michigan Consumer Sentiment Index (ICS), lagged one month for publication delay:
+\paragraph{Michigan Consumer Sentiment Change.} Year-over-year percentage change, lagged one month:
 \begin{equation}
     \text{sent\_change}_t = \frac{ICS_{t-1}}{ICS_{t-13}} - 1
 \end{equation}
-Consumer sentiment is a leading indicator of economic activity and has been shown to predict equity returns (Lemmon and Portniaguina \cite{lemmon2006}).
 
-\paragraph{Expanding Z-Score (No Look-Ahead Bias).} Each feature is standardized using \textit{only past data}:
+\section{Liquidity Filter Formulas}
+\label{app:liquidity}
+
+The universe construction applies a two-stage liquidity filter within each Fama-French 12 industry:
+\begin{equation}
+    \mathcal{U}_t = \left\{ i : V^{med}_{i,t} \geq Q_{80\%}(V^{med}_{ind(i),t}) \text{ and } P_{i,t} > \$3 \right\}
+\end{equation}
+where $V^{med}_{i,t}$ is the rolling 12-month median dollar volume and $Q_{80\%}$ denotes the 80th percentile within each industry.
+
+\paragraph{Dollar Volume Calculation.}
+Rolling median dollar volume requires a minimum of 6 valid observations:
+\begin{equation}
+    V^{med}_{i,t} = \text{median}\left(P_{i,s} \times \text{VOL}_{i,s}\right)_{s=t-11}^{t}, \quad \text{requiring } n \geq 6 \text{ valid obs.}
+\end{equation}
+
+\section{Transaction Cost Formulas}
+\label{app:tx-costs}
+
+The two-stage industry ETF framework requires matching transaction cost accounting.
+
+\paragraph{Stage 1: Within-Industry Rebalancing.}
+Each industry ETF is a value-weighted portfolio. When prices change, weights drift from target:
+\begin{equation}
+    \text{cost}^{Stage1}_t = \sum_{k=1}^{12} \Omega_{k,t} \times \tau_{k,t}^{within} \times C_{bps}, \quad \tau_{k,t}^{within} = \sum_{i \in k} |w_{i,t}^{Target} - w_{i,t}^{Drifted}|
+\end{equation}
+
+\paragraph{Stage 2: HRP Rebalancing Across Industries.}
+\begin{equation}
+    \text{cost}^{Stage2}_t = \sum_{k=1}^{12} |\Omega_{k,t}^{Target} - \Omega_{k,t}^{Drifted}| \times C_{bps}
+\end{equation}
+
+\paragraph{Leverage Overlay Cost.}
+When changing leverage, both sides are traded:
+\begin{equation}
+    \text{cost}^{Leverage}_t = 2 \times |L_t - L_{t-1}| \times C_{bps}
+\end{equation}
+
+\paragraph{Financing Cost.}
+When leveraged ($L_t > 1$):
+\begin{equation}
+    \text{cost}^{Financing}_t = \max(L_t - 1, 0) \times s
+\end{equation}
+where $s = 50$ bps financing spread.
+
+\paragraph{Net Returns.}
+\begin{equation}
+    r_{net,t} = L_t \cdot r_{HRP,t} + (1-L_t) \cdot r_f - \text{cost}^{Stage1}_t - \text{cost}^{Stage2}_t - \text{cost}^{Leverage}_t - \text{cost}^{Financing}_t
+\end{equation}
+
+\paragraph{Expanding Z-Score.} Each feature is standardized using \textit{only past data}:
 \begin{equation}
     z_t = \frac{x_t - \bar{x}_{1:t-1}}{\sigma_{1:t-1}}
 \end{equation}
-where $\bar{x}_{1:t-1}$ and $\sigma_{1:t-1}$ are computed on observations strictly before time $t$.
 
-\subsubsection{Phase 2: Regime Identification (Hidden Markov Model)}
-
-Market regimes are modeled as a 2-state Gaussian HMM with 3-dimensional observations. The model parameters are $\boldsymbol{\theta} = (\boldsymbol{\pi}, \mathbf{A}, \boldsymbol{\mu}_0, \boldsymbol{\Sigma}_0, \boldsymbol{\mu}_1, \boldsymbol{\Sigma}_1)$, where $\boldsymbol{\mu}_k \in \mathbb{R}^3$ and $\boldsymbol{\Sigma}_k \in \mathbb{R}^{3 \times 3}$ for $k \in \{0, 1\}$.
-
-\paragraph{Forward-Only Filter (Critical for Avoiding Look-Ahead Bias).}
-Standard HMM inference uses the forward-backward algorithm, which computes \textit{smoothed} posteriors $P(q_t | O_{1:T})$ using future observations---a severe form of look-ahead bias. A forward-only filter is implemented, computing \textit{filtered} posteriors:
-\begin{equation}
-    P(q_t = j | O_{1:t}) = \frac{\alpha_t(j)}{\sum_{k} \alpha_t(k)}
-\end{equation}
-where the forward variable $\alpha_t(j) = P(O_{1:t}, q_t = j)$ is computed recursively:
-\begin{equation}
-    \alpha_t(j) = P(O_t | q_t = j) \sum_{i} \alpha_{t-1}(i) \cdot A_{ij}
-\end{equation}
-This ensures regime labels use only information available at time $t$.
-
-\Cref{fig:forward-filter} illustrates the critical difference between the two approaches.
-
-\begin{figure}[htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}[
     obs/.style={circle, draw=black!70, fill=gray!20, minimum size=0.6cm, font=\scriptsize},
@@ -440,22 +975,43 @@ This ensures regime labels use only information available at time $t$.
 \node[font=\scriptsize, gray] at (3*1.2, 2.7) {time $t=3$};
 
 \end{tikzpicture}
-\caption{Forward-Backward vs Forward-Only HMM Inference. The standard forward-backward algorithm (top) computes $P(q_t | O_{1:T})$ using all observations including future ones---a severe form of look-ahead bias. The forward-only filter (bottom) computes $P(q_t | O_{1:t})$ using only observations up to time $t$, ensuring no information leakage. Green arrows indicate observations used; gray dashed arrows indicate observations that would leak future information.}
+\caption{Forward-Backward vs Forward-Only HMM Inference. The standard forward-backward algorithm (top) computes $P(q_t | O_{1:T})$ using all observations including future ones---a severe form of look-ahead bias. The forward-only filter (bottom) computes $P(q_t | O_{1:t})$ using only observations up to time $t$, ensuring no information leakage.}
 \label{fig:forward-filter}
 \end{figure}
 
-\paragraph{State Labeling.} After fitting, states are relabeled by mean return: the state with lower mean return is ``Bear'' (0), higher mean is ``Bull'' (1).
+\section{Complete ML Methodology}
+\label{app:ml-methodology}
 
-\paragraph{Expanding-Window HMM Fitting.} The HMM is re-estimated every 12 months using all available data up to time $t$, starting after a 60-month burn-in period.
+This appendix provides the complete 6-phase methodology for regime-adaptive portfolio enhancement, expanding on the summary in \Cref{sec:methodology}.
 
-\subsubsection{Phase 3: Feature Engineering}
+\subsection*{Phase 1: HMM Input Construction}
 
-14 predictive features are constructed across four categories, all designed to predict the \textit{next month's} regime. \Cref{tab:features} summarizes the features; detailed formulas are provided in \Cref{app:features}.
+A 3-dimensional observation vector is constructed for the HMM:
+\begin{equation}
+    \mathbf{O}_t = \begin{bmatrix} \text{log\_return}_t^z \\ \text{downside\_dev}_t^z \\ \text{sent\_change}_t^z \end{bmatrix}
+\end{equation}
+The three features capture momentum (log returns), left-tail risk (6-month rolling downside deviation), and consumer confidence (YoY sentiment change). See \Cref{app:hmm-features} for exact formulas.
 
-\begin{table}[htbp]
+\subsection*{Phase 2: HMM Regime Identification}
+
+Market regimes are modeled as a 2-state Gaussian HMM with parameters $\boldsymbol{\theta} = (\boldsymbol{\pi}, \mathbf{A}, \boldsymbol{\mu}_0, \boldsymbol{\Sigma}_0, \boldsymbol{\mu}_1, \boldsymbol{\Sigma}_1)$, where $\boldsymbol{\mu}_k \in \mathbb{R}^3$ and $\boldsymbol{\Sigma}_k \in \mathbb{R}^{3 \times 3}$.
+
+\paragraph{Forward-Only Filter.} Filtered posteriors are computed as:
+\begin{equation}
+    P(q_t = j | O_{1:t}) = \frac{\alpha_t(j)}{\sum_{k} \alpha_t(k)}
+\end{equation}
+where $\alpha_t(j) = P(O_t | q_t = j) \sum_{i} \alpha_{t-1}(i) \cdot A_{ij}$.
+
+\paragraph{Expanding-Window Fitting.} The HMM is re-estimated every 12 months using all available data up to time $t$, starting after 120 months minimum training.
+
+\subsection*{Phase 3: Feature Engineering}
+
+13 predictive features are constructed across four categories:
+
+\begin{table}[H]
 \centering
-\caption{Feature Categories and Descriptions (see \Cref{app:features} for formulas)}
-\label{tab:features}
+\caption{Feature Categories and Descriptions}
+\label{tab:features-app}
 \begin{tabular}{lllc}
 \toprule
 Category & Feature & Description & Z Window \\
@@ -472,7 +1028,6 @@ Macro & \texttt{credit\_spread} & BAA $-$ 10Y Treasury & 60M \\
 & \texttt{unrate\_trend} & UNRATE deviation from 12M MA & 60M \\
 \midrule
 Factor & \texttt{valuation\_spread\_z} & Value spread log(Q5/Q1 B/M) & 60M \\
-& \texttt{rsi} & Market RSI & --- \\
 \midrule
 Strategy & \texttt{hrp\_mom\_1m\_z} & 1-month HRP return & 24M \\
 Momentum & \texttt{hrp\_mom\_3m\_z} & 3-month cumulative return & 24M \\
@@ -481,22 +1036,13 @@ Momentum & \texttt{hrp\_mom\_3m\_z} & 3-month cumulative return & 24M \\
 \end{tabular}
 \end{table}
 
-\paragraph{Rolling Z-Score with Lag.} All Z-scored features use the formula:
-\begin{equation}
-    z_t = \frac{x_t - \bar{x}_{t-W:t-1}}{\sigma_{t-W:t-1}}
-\end{equation}
-where $W$ is the rolling window (24--60 months depending on feature). The \texttt{shift(1)} ensures strictly ex-ante normalization.
-
-\paragraph{Macro Data Lags.} CPI, M2, and UNRATE are lagged by 1 month to account for publication delay; interest rates are available in real-time.
-
 \paragraph{Target Variable.} Features at time $t$ predict the regime at time $t+1$: $y_t = \text{regime}_{t+1}$.
 
-\subsubsection{Phase 4: Walk-Forward XGBoost Prediction}
+\subsection*{Phase 4: Walk-Forward XGBoost Prediction}
 
-Next month's regime is predicted using XGBoost (Chen and Guestrin \cite{chen2016}) with a rigorous walk-forward protocol.
+\paragraph{Hyperparameters.} Following Gu, Kelly, and Xiu \cite{gu2020}: \texttt{max\_depth}=3, \texttt{learning\_rate}=0.05, \texttt{n\_estimators}=500, \texttt{reg\_alpha}=2, \texttt{reg\_lambda}=5.
 
-\paragraph{Purged Time-Series Cross-Validation.}
-To prevent information leakage from overlapping features (e.g., 12-month momentum overlaps with 12-month regime patterns), purged CV is implemented following L\'opez de Prado \cite{lopez2018}:
+\paragraph{Purged Time-Series CV.} Following L\'opez de Prado \cite{prado2018}:
 \begin{itemize}
     \item \textbf{purge\_gap} = 12 months: removes observations between train and test folds
     \item \textbf{embargo\_pct} = 1\%: additional buffer after test folds
@@ -507,850 +1053,38 @@ To prevent information leakage from overlapping features (e.g., 12-month momentu
     \item Initialize at month 120 (10 years minimum training)
     \item At each refit point (every 12 months):
     \begin{enumerate}
-        \item \textbf{Winsorize} features at 1\%/99\% using training bounds only
-        \item \textbf{Select features} via permutation importance with purged CV
-        \item \textbf{Tune hyperparameters} with Optuna (20 trials) using purged CV
-        \item \textbf{Train} final XGBoost model on all available training data
+        \item Winsorize features at 1\%/99\% using training bounds only
+        \item Train XGBoost on all available training data
     \end{enumerate}
     \item Generate out-of-sample predictions for next 12 months
     \item Advance window and repeat
 \end{enumerate}
 
-All three operations (winsorization, feature selection, hyperparameter tuning) occur \textit{inside} the walk-forward loop using only training data, preventing any form of look-ahead bias. \Cref{fig:walk-forward} illustrates this expanding-window approach.
+\subsection*{Phase 5: Portfolio Overlay}
 
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[
-    trainblock/.style={rectangle, draw=blue!70, fill=blue!20, minimum height=0.5cm, font=\scriptsize},
-    purgeblock/.style={rectangle, draw=gray!70, fill=gray!30, minimum height=0.5cm, font=\scriptsize},
-    testblock/.style={rectangle, draw=green!70, fill=green!30, minimum height=0.5cm, font=\scriptsize},
-]
-
-% Time axis
-\draw[->, thick] (0, 0) -- (12, 0) node[right] {\scriptsize Time};
-
-% Year labels
-\foreach \x/\label in {0/0, 2/Yr5, 4/Yr10, 6/Yr15, 8/Yr20, 10/Yr25} {
-    \draw (\x, -0.1) -- (\x, 0.1);
-    \node[below, font=\scriptsize] at (\x, -0.1) {\label};
-}
-
-% Refit 1: Year 10
-\node[trainblock, minimum width=4cm] at (2, 1.2) {};
-\node[purgeblock, minimum width=0.4cm] at (4.2, 1.2) {};
-\node[testblock, minimum width=0.8cm] at (4.8, 1.2) {};
-\node[left, font=\scriptsize] at (0, 1.2) {Refit 1};
-
-% Refit 2: Year 11
-\node[trainblock, minimum width=4.8cm] at (2.4, 2) {};
-\node[purgeblock, minimum width=0.4cm] at (5, 2) {};
-\node[testblock, minimum width=0.8cm] at (5.6, 2) {};
-\node[left, font=\scriptsize] at (0, 2) {Refit 2};
-
-% Refit 3: Year 12
-\node[trainblock, minimum width=5.6cm] at (2.8, 2.8) {};
-\node[purgeblock, minimum width=0.4cm] at (5.8, 2.8) {};
-\node[testblock, minimum width=0.8cm] at (6.4, 2.8) {};
-\node[left, font=\scriptsize] at (0, 2.8) {Refit 3};
-
-% Refit N
-\node[font=\scriptsize] at (0.5, 3.4) {$\vdots$};
-\node[trainblock, minimum width=8cm] at (4, 4) {};
-\node[purgeblock, minimum width=0.4cm] at (8.2, 4) {};
-\node[testblock, minimum width=0.8cm] at (8.8, 4) {};
-\node[left, font=\scriptsize] at (0, 4) {Refit $N$};
-
-% Legend
-\node[trainblock, minimum width=0.6cm] at (9.5, 1.2) {};
-\node[right, font=\scriptsize] at (9.8, 1.2) {Train};
-\node[purgeblock, minimum width=0.6cm] at (9.5, 0.6) {};
-\node[right, font=\scriptsize] at (9.8, 0.6) {Purge (12M)};
-\node[testblock, minimum width=0.6cm] at (9.5, 0) {};
-\node[right, font=\scriptsize] at (9.8, 0) {Test (OOS)};
-
-% Annotations
-\draw[decorate, decoration={brace, amplitude=5pt, raise=2pt}] (0, 1.5) -- (4, 1.5) 
-    node[midway, above=8pt, font=\scriptsize] {Min 120 months};
-
-\end{tikzpicture}
-\caption{Walk-Forward Backtesting with Purged Cross-Validation. The training window expands over time (blue), with a 12-month purge gap (gray) separating training from out-of-sample test periods (green). Feature selection, winsorization, and hyperparameter tuning all occur inside each training window, ensuring no look-ahead bias.}
-\label{fig:walk-forward}
-\end{figure}
-
-\subsubsection{Phase 5: Portfolio Overlay (Two-Fund Separation)}
-
-The regime prediction adjusts HRP exposure through a two-fund separation framework, illustrated in \Cref{fig:two-fund}:
+Two-fund separation \cite{tobin1958} mixes HRP with T-Bills based on bull probability:
 \begin{equation}
-    r_{portfolio,t} = w_t \cdot r_{HRP,t} + (1 - w_t) \cdot r_{f,t}
+    L_t = P(\text{Bull}_t) \times \frac{1}{\bar{P}(\text{Bull})}
 \end{equation}
 
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[
-    asset/.style={rectangle, rounded corners, draw=black!70, minimum width=2.2cm, minimum height=1cm, font=\small, text centered},
-]
-
-% Assets
-\node[asset, fill=blue!20] (hrp) at (0, 0) {\textbf{HRP}\\Portfolio};
-\node[asset, fill=gray!20] (tbill) at (6, 0) {\textbf{T-Bills}\\Risk-Free};
-
-% Lever/slider
-\draw[very thick, gray!50] (1.5, 0) -- (4.5, 0);
-\fill[blue!60] (1.5, -0.15) rectangle (4.5, 0.15);
-
-% Lever position indicator (movable)
-\node[circle, fill=orange!80, draw=orange!90, minimum size=0.5cm, font=\scriptsize\bfseries] (lever) at (3.5, 0) {$L_t$};
-
-% Annotations
-\draw[<->, thick] (1.5, -0.8) -- (4.5, -0.8);
-\node[below, font=\scriptsize] at (3, -0.8) {Allocation $L_t = P(\text{Bull}) \times \kappa$};
-
-% Regions
-\node[font=\scriptsize, text=green!60!black] at (2.2, 0.7) {Defensive};
-\node[font=\scriptsize, text=green!60!black] at (2.2, 0.4) {$L < 1$};
-\node[font=\scriptsize, text=red!70] at (3.8, 0.7) {Leveraged};
-\node[font=\scriptsize, text=red!70] at (3.8, 0.4) {$L > 1$};
-
-% Center line
-\draw[dashed, gray] (3, -0.5) -- (3, 1);
-\node[above, font=\scriptsize] at (3, 1) {$L=1$};
-
-% Financing costs annotation
-\draw[decorate, decoration={brace, amplitude=5pt, raise=2pt, mirror}] (3.1, -0.3) -- (4.5, -0.3) 
-    node[midway, below=8pt, font=\scriptsize, text=red!70] {Pay $r_f + s$};
-\draw[decorate, decoration={brace, amplitude=5pt, raise=2pt, mirror}] (1.5, -0.3) -- (2.9, -0.3) 
-    node[midway, below=8pt, font=\scriptsize, text=green!60!black] {Earn $r_f$};
-
-\end{tikzpicture}
-\caption{Two-Fund Separation Framework. The leverage ratio $L_t$ determines the allocation between the HRP portfolio and T-Bills. When $L_t < 1$ (defensive), the investor holds cash earning $r_f$. When $L_t > 1$ (leveraged), the investor borrows at $r_f + s$ to increase HRP exposure. The P(Bull)-scaled strategy sets $L_t = P(\text{Bull}_t) \times \kappa$.}
-\label{fig:two-fund}
-\end{figure}
-
-For the P(Bull)-scaled strategy:
-\begin{equation}
-    w_t = P(\text{Bull}_t) \times \frac{1}{\bar{P}(\text{Bull})}
-\end{equation}
-where $\bar{P}(\text{Bull})$ is the historical mean bull probability. This scaling ensures mean leverage equals 1 (fair comparison with buy-and-hold HRP).
-
-\paragraph{Note on Look-Ahead Bias.}
-It is acknowledged that using the full-sample mean $\bar{P}(\text{Bull})$ introduces a minor form of look-ahead bias, as the scaling factor is computed over the entire backtest period. However, this choice is made \textit{solely for comparison purposes}: it ensures that the regime-adaptive strategy has the same average equity exposure as buy-and-hold HRP, isolating the timing effect from any leverage effect. In a live implementation, a practitioner would replace $1/\bar{P}(\text{Bull})$ with a constant $\kappa$ calibrated to their risk aversion level:
-\begin{equation}
-    w_t = \kappa \cdot P(\text{Bull}_t)
-\end{equation}
-where $\kappa$ controls the aggressiveness of the strategy. This eliminates any look-ahead bias while preserving the regime-timing signal.
-
-\paragraph{Leverage Mechanics and Financing Costs.}
-Asymmetric financing costs are modeled reflecting real-world borrowing constraints \cite{ibkr2025}:
-\begin{itemize}
-    \item When $w_t < 1$: Hold $(1-w_t)$ in 1-month T-Bills, earning the risk-free rate $r_f$
-    \item When $w_t > 1$: Borrow $(w_t-1)$ at $r_f + s$ to lever up HRP exposure, where $s$ is the financing spread
-\end{itemize}
-
-The portfolio return under leverage is:
+\paragraph{Financing Costs.} When $L_t > 1$:
 \begin{equation}
     r_{portfolio,t} = \begin{cases}
-        w_t \cdot r_{HRP,t} + (1-w_t) \cdot r_f & \text{if } w_t \leq 1 \text{ (long T-Bills)} \\
-        w_t \cdot r_{HRP,t} - (w_t-1) \cdot (r_f + s) & \text{if } w_t > 1 \text{ (borrowing)}
+        L_t \cdot r_{HRP,t} + (1-L_t) \cdot r_f & \text{if } L_t \leq 1 \\
+        L_t \cdot r_{HRP,t} - (L_t-1) \cdot (r_f + s) & \text{if } L_t > 1
     \end{cases}
 \end{equation}
-The spread is set at $s = 50$ basis points, consistent with institutional margin rates for portfolios in the \$50M--\$250M AUM range.
+where $s = 50$ bps financing spread.
 
-\subsubsection{Phase 6: Transaction Cost Analysis}
+\subsection*{Phase 6: Transaction Cost Analysis}
 
-Three layers of costs are modeled with careful attention to drift-adjusted turnover and both sides of leverage trades. \Cref{fig:tx-costs} provides a visual breakdown.
-
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[
-    costbox/.style={rectangle, rounded corners, draw=black!70, minimum width=3cm, minimum height=0.9cm, font=\small, text centered},
-    smallbox/.style={rectangle, rounded corners, draw=black!50, minimum width=2.5cm, minimum height=0.6cm, font=\scriptsize, text centered},
-]
-
-% GROSS return
-\node[costbox, fill=green!30] (gross) at (0, 3) {\textbf{GROSS Return}\\$L_t \cdot r_{HRP} + (1-L_t) \cdot r_f$};
-
-% Minus signs and costs
-\node[font=\large] at (0, 2.3) {$-$};
-
-% Cost boxes
-\node[smallbox, fill=blue!20] (inner) at (-3.5, 1.5) {\textbf{Inner Cost}\\HRP turnover};
-\node[smallbox, fill=orange!20] (outer) at (0, 1.5) {\textbf{Outer Cost}\\Leverage change};
-\node[smallbox, fill=red!20] (finance) at (3.5, 1.5) {\textbf{Financing}\\Borrow spread};
-
-% Formulas
-\node[font=\scriptsize] at (-3.5, 0.8) {$L_t \cdot \sum|w^{tgt} - w^{drift}| \cdot C$};
-\node[font=\scriptsize] at (0, 0.8) {$2 \cdot |L_t - L_{t-1}| \cdot C$};
-\node[font=\scriptsize] at (3.5, 0.8) {$\max(L_t-1, 0) \cdot s$};
-
-% Equals sign
-\node[font=\large] at (0, 0.2) {$=$};
-
-% NET return
-\node[costbox, fill=yellow!30] (net) at (0, -0.5) {\textbf{NET Return}};
-
-% Arrows
-\draw[->, thick] (gross) -- (0, 2.5);
-\draw[->, thick, blue!70] (inner) -- (-1.5, 0.2);
-\draw[->, thick, orange!70] (outer) -- (0, 0.4);
-\draw[->, thick, red!70] (finance) -- (1.5, 0.2);
-
-% Annotations
-\node[right, font=\scriptsize, text=gray] at (4.5, 3) {No costs};
-\node[right, font=\scriptsize, text=gray] at (4.5, -0.5) {After all costs};
-
-\end{tikzpicture}
-\caption{Transaction Cost Breakdown. GROSS returns assume no trading costs and borrowing at $r_f$. NET returns subtract three cost components: (1) inner costs from HRP portfolio rebalancing scaled by leverage, (2) outer costs from leverage changes (charged on both sides), and (3) financing spread paid only when leveraged ($L_t > 1$).}
-\label{fig:tx-costs}
-\end{figure}
-
-\paragraph{Inner Cost (HRP Rebalancing).}
-A common error in turnover calculation is comparing target weights at consecutive dates: $|w_{i,t}^{Target} - w_{i,t-1}^{Target}|$. This \textit{underestimates} true turnover because it ignores price drift during the holding period. If a stock doubles in price, its weight in the portfolio also doubles before any trading occurs.
-
-\textit{Drift-adjusted turnover} is computed as:
-\begin{equation}
-    \text{inner}_t = \left( \sum_{i=1}^{N} |w_{i,t}^{Target} - w_{i,t}^{Drifted}| \right) \times C_{bps}
-\end{equation}
-where the drifted weight reflects how the portfolio evolved due to differential returns:
-\begin{equation}
-    w_{i,t}^{Drifted} = w_{i,t-1}^{Target} \times \frac{1 + r_{i,t}}{1 + r_{portfolio,t}}
-\end{equation}
-This captures the actual trading required: from where the portfolio \textit{drifted to} the new target weights.
-
-\paragraph{Outer Cost (Leverage Overlay).}
-When changing the leverage ratio, the investor trades \textit{both} sides:
-\begin{itemize}
-    \item If increasing leverage ($L_t > L_{t-1}$): Buy HRP stocks AND sell T-Bills
-    \item If decreasing leverage ($L_t < L_{t-1}$): Sell HRP stocks AND buy T-Bills
-\end{itemize}
-Therefore, the outer cost charges both sides of the trade:
-\begin{equation}
-    \text{outer}_t = 2 \times |L_t - L_{t-1}| \times C_{bps}
-\end{equation}
-
-\paragraph{Net Returns.}
-The final net return incorporates transaction costs and financing spreads:
-\begin{equation}
-    r_{net,t} = r_{portfolio,t}^{financed} - \text{inner}_t \cdot L_t - \text{outer}_t
-\end{equation}
-where $r_{portfolio,t}^{financed}$ is the gross return including the asymmetric financing cost from Phase 5.
-
-%==============================================================================
-% 4. DATA DESCRIPTION
-%==============================================================================
-\section{Data Description}
-\label{sec:data}
-
-\subsection{Data Sources}
-
-This analysis integrates four primary data sources spanning 1960--2024:
-
-\begin{table}[htbp]
-\centering
-\caption{Data Sources and Coverage}
-\label{tab:data}
-\begin{tabular}{llll}
-\toprule
-Source & Variables & Frequency & Coverage \\
-\midrule
-CRSP & Stock returns, prices, volume & Monthly & 1960--2024 \\
-Compustat & Book equity (seqq) & Quarterly & 1970--2024 \\
-FRED & BAA, DGS10, TB3MS, CPI, M2, UNRATE, UMICH ICS & Monthly & 1960--2024 \\
-Fama-French & Industry classifications, factors & Monthly & 1960--2024 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{CRSP Stock Data}
-
-The CRSP dataset contains monthly returns for all NYSE, AMEX, and NASDAQ stocks. Key preprocessing steps include:
-
-\paragraph{Delisting Return Adjustment.}
-Following Shumway \cite{shumway1997}, delisting bias is adjusted for:
-\begin{equation}
-    r_{adjusted} = \begin{cases}
-        (1 + r_t)(1 + r_{delist}) - 1 & \text{if delisting in month } t \\
-        r_t & \text{otherwise}
-    \end{cases}
-\end{equation}
-where $r_{delist}$ is the delisting return from CRSP.
-
-\paragraph{Liquidity Filter.}
-Rolling median dollar volume is computed with a minimum of 6 valid observations over 6 months:
-\begin{equation}
-    V^{med}_{i,t} = \text{median}\left(P_{i,s} \times \text{VOL}_{i,s}\right)_{s=t-5}^{t}, \quad \text{requiring } n \geq 6 \text{ valid obs.}
-\end{equation}
-
-\subsection{Macroeconomic Data}
-
-FRED data is aligned to month-end and transformed as follows:
-\begin{itemize}
-    \item \textbf{Credit Spread}: BAA yield minus 10-year Treasury (DGS10)
-    \item \textbf{Term Spread}: 10-year Treasury minus 3-month T-Bill (TB3MS)
-    \item \textbf{CPI Volatility}: 12-month rolling standard deviation of CPI changes
-    \item \textbf{M2 Growth}: Year-over-year percentage change in M2
-    \item \textbf{Unemployment Trend}: 12-month change in unemployment rate
-\end{itemize}
-
-\subsection{Data Quality and Preprocessing}
-
-\begin{table}[htbp]
-\centering
-\caption{Dataset Statistics}
-\label{tab:stats}
-\begin{tabular}{lr}
-\toprule
-Metric & Value \\
-\midrule
-Total months available & 768 (1960--2024) \\
-HRP backtest months & 624 (1972--2024) \\
-ML prediction months & 456 (1986--2024) \\
-Minimum training period & 120 months \\
-Missing data handling & Forward-fill, then drop \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Exploratory Data Analysis}
-
-Before model building, exploratory analysis was conducted to understand the data characteristics:
-
-\paragraph{Return Distribution.}
-Monthly CRSP returns exhibit the well-known properties of financial time series: slight negative skewness ($-0.52$), excess kurtosis ($2.3$), and fat tails relative to the normal distribution. The Jarque-Bera test strongly rejects normality ($p < 0.001$), motivating the use of robust covariance estimation.
-
-\paragraph{Correlation Dynamics.}
-Average pairwise correlation varies substantially over time, ranging from 0.15 in calm markets to above 0.60 during crises. This time-varying correlation structure supports the regime-switching framework.
-
-\paragraph{Feature Distributions.}
-All features are standardized to Z-scores with rolling windows. 1\%/99\% winsorization is applied to handle extreme values, with bounds computed from training data only to prevent look-ahead bias. \Cref{fig:feature_corr} in the supplementary materials shows feature correlations with the target regime variable.
-
-%==============================================================================
-% 5. IMPLEMENTATION
-%==============================================================================
-\section{Implementation}
-\label{sec:implementation}
-
-\subsection{Code Architecture}
-
-The implementation follows a modular design with separation of concerns:
-
-\begin{table}[htbp]
-\centering
-\caption{Module Architecture}
-\label{tab:modules}
-\begin{tabular}{ll}
-\toprule
-Module & Responsibility \\
-\midrule
-\texttt{hrp\_data.py} & Data loading, filtering, universe construction \\
-\texttt{hrp\_functions.py} & HRP weight computation, clustering \\
-\texttt{cov\_shrinkage.py} & RMT denoising, covariance estimation \\
-\texttt{hrp\_pipeline.py} & HRP orchestration, backtesting \\
-\texttt{hrp\_hmm.py} & HMM regime detection, forward filter \\
-\texttt{hrp\_features.py} & Feature engineering, Z-scoring \\
-\texttt{hrp\_ml.py} & XGBoost training, walk-forward prediction \\
-\texttt{hrp\_strategy.py} & Portfolio overlay, transaction costs \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{GPU Acceleration}
-
-The covariance matrix computation is accelerated using CUDA via CuPy. For a universe of $N$ assets and $T$ time periods:
-
-\begin{algorithm}[htbp]
-\caption{GPU-Accelerated Covariance Estimation}
-\label{alg:gpu}
-\begin{algorithmic}
-\REQUIRE Returns matrix $\mathbf{R} \in \R^{T \times N}$
-\STATE Transfer $\mathbf{R}$ to GPU memory
-\STATE Compute $\bar{\mathbf{r}} = \frac{1}{T}\sum_{t=1}^{T} \mathbf{r}_t$ (GPU vectorized)
-\STATE Compute $\hat{\Sigma} = \frac{1}{T-1}(\mathbf{R} - \bar{\mathbf{r}})^\top(\mathbf{R} - \bar{\mathbf{r}})$ (cuBLAS)
-\STATE Eigendecomposition via cuSOLVER
-\STATE Apply RMT denoising (GPU kernels)
-\STATE Transfer result to CPU
-\RETURN Denoised covariance $\tilde{\Sigma}$
-\end{algorithmic}
-\end{algorithm}
-
-This achieves approximately 50$\times$ speedup over CPU-based NumPy for large universes ($N > 500$).
-
-\subsection{Walk-Forward Implementation}
-
-The walk-forward prediction includes several safeguards against look-ahead bias:
-
+Transaction costs (10 bps per trade) are applied at four stages:
 \begin{enumerate}
-    \item \textbf{Winsorization}: Bounds computed from training data only, then applied to test data
-    \item \textbf{Feature Selection}: Performed inside walk-forward using training data cross-validation
-    \item \textbf{Hyperparameter Tuning}: Optuna optimization inside walk-forward with purged CV
-    \item \textbf{HMM Training}: Expanding window with forward-only filtering
+    \item Within-industry stock rebalancing (value-weighted drift)
+    \item Across-industry HRP rebalancing
+    \item Leverage overlay adjustments ($2 \times |L_t - L_{t-1}|$)
+    \item Financing spreads when leveraged ($L > 1$)
 \end{enumerate}
-
-\subsection{Configuration Management}
-
-All hyperparameters are externalized to \texttt{config.yaml}:
-
-\begin{verbatim}
-data:
-  window: 60          # Lookback for covariance
-  rebalance_freq: 1M  # Monthly rebalancing
-  
-hmm:
-  min_train: 60       # Minimum HMM training months
-  refit_freq: 12      # HMM refit frequency
-  downside_window: 6  # Downside deviation window
-
-ml:
-  min_train_months: 120
-  optuna_trials_per_refit: 20
-  purge_gap: 12
-  embargo_pct: 0.01
-
-strategy:
-  tx_cost_bps: 10
-  financing_spread_bps: 50
-\end{verbatim}
-
-%==============================================================================
-% 6. RESULTS
-%==============================================================================
-\section{Results}
-\label{sec:results}
-
-\subsection{HMM Regime Detection}
-
-The 2-state, 3-feature HMM successfully identifies distinct market regimes characterized by volatility patterns. The addition of Michigan Consumer Sentiment as a third input feature improves regime differentiation:
-
-\begin{table}[htbp]
-\centering
-\caption{HMM Regime Characteristics (1972--2024)}
-\label{tab:hmm}
-\begin{tabular}{lrrrrr}
-\toprule
-Regime & Months & Proportion & Ann. Return & Ann. Vol & Characteristics \\
-\midrule
-Bear & 154 & 24.5\% & $+4.5\%$ & 20.3\% & High volatility, low sentiment \\
-Bull & 474 & 75.5\% & $+13.3\%$ & 13.0\% & Low volatility, stable sentiment \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The transition matrix shows strong regime persistence:
-\begin{equation}
-    \mathbf{P} = \begin{bmatrix} P(\text{Bear}|\text{Bear}) & P(\text{Bull}|\text{Bear}) \\ P(\text{Bear}|\text{Bull}) & P(\text{Bull}|\text{Bull}) \end{bmatrix} \approx \begin{bmatrix} 0.85 & 0.15 \\ 0.05 & 0.95 \end{bmatrix}
-\end{equation}
-
-The expected duration is 6.7 months for bear regimes and 20.6 months for bull regimes. Bear regimes correspond to high-volatility market conditions (20.3\% annualized volatility vs 13.0\% for bull), which include known crisis periods: 1973--74 oil shock, 1987 crash, 2000--02 dot-com bust, 2008--09 financial crisis, and 2020 COVID crash. Note that ``bear'' refers to elevated risk rather than negative returns.
-
-\begin{figure}[htbp]
-\centering
-% Placeholder for HMM regimes figure
-\fbox{\parbox{0.85\textwidth}{\centering\vspace{3cm}
-\textbf{Figure: HMM Regime Detection (1972--2024)}\\[1em]
-Top panel: Z-scored HMM inputs (log returns, downside deviation, sentiment change).\\
-Middle panel: P(Bull) probability over time with regime shading.\\
-Bottom panel: Cumulative returns colored by regime.
-\vspace{3cm}}}
-\caption{HMM regime detection using 3-feature input. Red shading indicates bear (high-volatility) regimes. The model successfully identifies major market stress periods while maintaining regime persistence.}
-\label{fig:hmm-regimes}
-\end{figure}
-
-\subsection{XGBoost Prediction Performance}
-
-The walk-forward XGBoost achieves the following out-of-sample metrics over 456 months (1986--2024):
-
-\begin{table}[htbp]
-\centering
-\caption{Regime Prediction Metrics (Out-of-Sample)}
-\label{tab:xgb}
-\begin{tabular}{lr}
-\toprule
-Metric & Value \\
-\midrule
-Accuracy & 66.2\% \\
-ROC-AUC & 0.765 \\
-Bear Precision & 35.4\% \\
-Bull Precision & 89.9\% \\
-Bear Recall & 72.9\% \\
-Bull Recall & 64.4\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{figure}[htbp]
-\centering
-% Placeholder for XGBoost analysis figure
-\fbox{\parbox{0.85\textwidth}{\centering\vspace{3cm}
-\textbf{Figure: XGBoost Regime Prediction Analysis}\\[1em]
-Top-left: ROC curve with AUC.\\
-Top-right: Predicted P(Bull) vs actual regimes over time.\\
-Bottom: Feature importance bar chart (averaged across walk-forward refits).
-\vspace{3cm}}}
-\caption{XGBoost model performance. The model achieves 72.9\% recall on bear regimes, successfully identifying most high-volatility periods at the cost of some false positives (35.4\% precision).}
-\label{fig:xgb-analysis}
-\end{figure}
-
-\paragraph{Feature Importance.}
-Averaged across all walk-forward refits, the most important features are:
-\begin{enumerate}
-    \item \texttt{hrp\_mom\_12m\_z}: 12-month HRP momentum (importance: 0.18)
-    \item \texttt{avg\_pairwise\_corr\_z}: Average correlation (importance: 0.14)
-    \item \texttt{credit\_spread}: Credit spread (importance: 0.12)
-    \item \texttt{term\_spread}: Term spread (importance: 0.11)
-    \item \texttt{dispersion\_z}: Return dispersion (importance: 0.09)
-\end{enumerate}
-
-Strategy momentum features prove highly predictive, suggesting regime persistence is a key signal. The dominance of the 12-month HRP momentum indicates that past portfolio performance is informative about future volatility regimes.
-
-\paragraph{Confusion Matrix Analysis.}
-The confusion matrix reveals the model's behavior:
-
-\begin{table}[htbp]
-\centering
-\caption{Confusion Matrix (Out-of-Sample Predictions)}
-\label{tab:confusion}
-\begin{tabular}{lcc}
-\toprule
-& Predicted Bear & Predicted Bull \\
-\midrule
-Actual Bear (96 months) & 70 (72.9\%) & 26 (27.1\%) \\
-Actual Bull (360 months) & 128 (35.6\%) & 232 (64.4\%) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The model exhibits high recall on bear regimes (72.9\%), successfully identifying most high-volatility periods. However, the lower precision on bear predictions (35.4\%) indicates that many bear predictions occur during bull regimes. This asymmetry is intentional: from a risk management perspective, it is preferable to occasionally reduce exposure during bull markets (opportunity cost) than to miss bear markets (realized losses).
-
-\subsection{Portfolio Performance}
-
-\begin{table}[htbp]
-\centering
-\caption{Strategy Performance Comparison (1986--2024, NET of Transaction Costs)}
-\label{tab:perf}
-\begin{tabular}{lrrrrr}
-\toprule
-Strategy & Ann. Return & Ann. Vol & Sharpe & Max DD & Win Rate \\
-\midrule
-CRSP VW Index & 11.4\% & 15.6\% & 0.54 & $-51.5\%$ & 65.2\% \\
-Buy \& Hold HRP & 10.1\% & 14.3\% & 0.51 & $-46.2\%$ & 64.5\% \\
-P(Bull) Scaled & 14.0\% & 12.4\% & 0.85 & $-21.1\%$ & 64.7\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Key findings:
-\begin{itemize}
-    \item HRP achieves lower volatility (14.3\% vs 15.6\%) and drawdowns than the market index
-    \item The regime-adaptive strategy improves Sharpe ratio by 67\% over static HRP (0.85 vs 0.51)
-    \item Maximum drawdown reduced from 46.2\% to 21.1\% through regime-based de-risking
-    \item The P(Bull)-scaled strategy achieves superior risk-adjusted returns with significantly lower drawdowns
-\end{itemize}
-
-\subsection{Drawdown Analysis: The Metric That Actually Matters}
-\label{sec:drawdown}
-
-\textit{While academic finance focuses predominantly on variance as the risk measure, practitioners know that drawdowns are what truly hurt investors.} A 50\% drawdown requires a 100\% gain to recover---a recovery that may take years or decades. Volatility is symmetric and mean-reverting; drawdowns are asymmetric and path-dependent. No investor ever lost sleep over upside volatility.
-
-\Cref{tab:drawdowns} presents the five largest drawdowns for each strategy, revealing the dramatic risk reduction achieved by regime-adaptive allocation:
-
-\begin{table}[htbp]
-\centering
-\caption{Top Five Drawdowns by Strategy (1986--2024)}
-\label{tab:drawdowns}
-\begin{tabular}{lrrrrrrr}
-\toprule
-Strategy & Sharpe & DD1 & DD2 & DD3 & DD4 & DD5 \\
-\midrule
-Buy \& Hold HRP & 0.55 & $-$45.7\% & $-$29.3\% & $-$25.1\% & $-$22.5\% & $-$22.3\% \\
-P(Bull) Scaled & 0.93 & $-$21.0\% & $-$17.8\% & $-$15.8\% & $-$14.6\% & $-$13.5\% \\
-CRSP VW Index & 0.59 & $-$39.6\% & $-$31.4\% & $-$26.3\% & $-$17.8\% & $-$16.6\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[htbp]
-\centering
-\caption{Drawdown Periods by Strategy}
-\label{tab:drawdown-periods}
-\begin{tabular}{llll}
-\toprule
-Rank & Buy \& Hold HRP & P(Bull) Scaled & CRSP VW Index \\
-\midrule
-1 & 2007-05 to 2009-01 & 1987-08 to 1987-10 & 2007-11 to 2008-10 \\
-2 & 1987-08 to 1987-10 & 1989-08 to 1990-09 & 2000-10 to 2003-02 \\
-3 & 1989-08 to 1990-09 & 2021-12 to 2022-08 & 2021-09 to 2022-09 \\
-4 & 2020-01 to 2020-02 & 2010-04 to 2010-05 & 1998-07 to 1998-08 \\
-5 & 1998-03 to 1998-07 & 2011-05 to 2011-08 & 2011-05 to 2011-09 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The results are striking:
-\begin{itemize}
-    \item \textbf{Maximum drawdown halved}: The regime-adaptive strategy's worst drawdown ($-$21.0\%) is less than half of HRP's ($-$45.7\%) and the market's ($-$39.6\%)
-    \item \textbf{Consistent tail protection}: All five worst drawdowns for P(Bull) Scaled ($-$21.0\%, $-$17.8\%, $-$15.8\%, $-$14.6\%, $-$13.5\%) are smaller than HRP's \textit{fifth} worst ($-$22.3\%)
-    \item \textbf{GFC avoided}: HRP's worst drawdown (2007--2009, $-$45.7\%) doesn't appear in P(Bull) Scaled's top 5---the strategy successfully de-risked
-    \item \textbf{Recovery time}: A 21\% drawdown requires only a 27\% gain to recover; a 46\% drawdown requires an 85\% gain
-    \item \textbf{Behavioral sustainability}: Investors can stay the course through a 20\% decline far more easily than a 50\% decline
-\end{itemize}
-
-\paragraph{Why This Matters More Than Sharpe Ratios.}
-The Sharpe ratio improvement from 0.55 to 0.93 is impressive, but consider the practical implications: an investor in static HRP during the Global Financial Crisis watched their portfolio lose 45.7\% of its value. The regime-adaptive investor, by de-risking during the bear regime, experienced only a 21\% decline. This is the difference between staying invested and panic-selling at the bottom.
-
-\Cref{fig:drawdown-comparison} visualizes this asymmetry: while variance measures treat a +10\% month the same as a $-$10\% month, the psychological and financial impact of losses is fundamentally different.
-
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[scale=0.85]
-% Five vertical bar groups for each strategy's top 5 drawdowns
-\definecolor{hrpcolor}{RGB}{220,60,60}
-\definecolor{probcolor}{RGB}{60,150,60}
-\definecolor{crspcolor}{RGB}{60,100,180}
-
-% Y-axis
-\draw[thick, ->] (0,0) -- (0,5.5) node[above, font=\small] {Drawdown (\%)};
-\draw[thick] (0,0) -- (16,0);
-
-% Y-axis labels (inverted: more negative = higher bar)
-\foreach \y/\label in {0/0, 1/-10, 2/-20, 3/-30, 4/-40, 5/-50} {
-    \draw (0,\y) -- (-0.15,\y) node[left, font=\scriptsize] {\label};
-}
-
-% Grid lines
-\foreach \y in {1,2,3,4,5} {
-    \draw[gray!30, dashed] (0,\y) -- (16,\y);
-}
-
-% HRP bars (DD1: -45.7, DD2: -29.3, DD3: -25.1, DD4: -22.5, DD5: -22.3)
-\fill[hrpcolor] (0.3,0) rectangle (0.9,4.57);
-\fill[hrpcolor!85] (1.0,0) rectangle (1.6,2.93);
-\fill[hrpcolor!70] (1.7,0) rectangle (2.3,2.51);
-\fill[hrpcolor!55] (2.4,0) rectangle (3.0,2.25);
-\fill[hrpcolor!40] (3.1,0) rectangle (3.7,2.23);
-\node[font=\scriptsize] at (2.0,4.57) [above] {45.7};
-\node[font=\scriptsize, hrpcolor] at (2.0,-0.4) {\textbf{HRP}};
-
-% P(Bull) Scaled bars (DD1: -21.0, DD2: -17.8, DD3: -15.8, DD4: -14.6, DD5: -13.5)
-\fill[probcolor] (5.3,0) rectangle (5.9,2.10);
-\fill[probcolor!85] (6.0,0) rectangle (6.6,1.78);
-\fill[probcolor!70] (6.7,0) rectangle (7.3,1.58);
-\fill[probcolor!55] (7.4,0) rectangle (8.0,1.46);
-\fill[probcolor!40] (8.1,0) rectangle (8.7,1.35);
-\node[font=\scriptsize] at (7.0,2.10) [above] {21.0};
-\node[font=\scriptsize, probcolor] at (7.0,-0.4) {\textbf{P(Bull) Scaled}};
-
-% CRSP VW bars (DD1: -39.6, DD2: -31.4, DD3: -26.3, DD4: -17.8, DD5: -16.6)
-\fill[crspcolor] (10.3,0) rectangle (10.9,3.96);
-\fill[crspcolor!85] (11.0,0) rectangle (11.6,3.14);
-\fill[crspcolor!70] (11.7,0) rectangle (12.3,2.63);
-\fill[crspcolor!55] (12.4,0) rectangle (13.0,1.78);
-\fill[crspcolor!40] (13.1,0) rectangle (13.7,1.66);
-\node[font=\scriptsize] at (12.0,3.96) [above] {39.6};
-\node[font=\scriptsize, crspcolor] at (12.0,-0.4) {\textbf{CRSP VW}};
-
-% Legend
-\node[font=\scriptsize] at (15.3,4.8) {DD1};
-\fill[black] (14.9,4.7) rectangle (15.1,4.9);
-\node[font=\scriptsize] at (15.3,4.3) {DD2};
-\fill[black!85] (14.9,4.2) rectangle (15.1,4.4);
-\node[font=\scriptsize] at (15.3,3.8) {DD3};
-\fill[black!70] (14.9,3.7) rectangle (15.1,3.9);
-\node[font=\scriptsize] at (15.3,3.3) {DD4};
-\fill[black!55] (14.9,3.2) rectangle (15.1,3.4);
-\node[font=\scriptsize] at (15.3,2.8) {DD5};
-\fill[black!40] (14.9,2.7) rectangle (15.1,2.9);
-
-% Annotation: recovery required
-\draw[<->, thick, orange!80!black] (0.9,4.57) -- (0.9,0) node[midway, right, font=\tiny, text width=1.3cm] {85\% to recover};
-\draw[<->, thick, green!60!black] (5.9,2.10) -- (5.9,0) node[midway, right, font=\tiny, text width=1.3cm] {27\% to recover};
-
-\end{tikzpicture}
-\caption{Visual comparison of the five largest drawdowns for each strategy. The regime-adaptive P(Bull) Scaled strategy's \textit{worst} drawdown ($-$21.0\%) is smaller than HRP's \textit{fifth} worst ($-$22.3\%). Notably, the GFC drawdown (2007--2009) that devastated HRP at $-$45.7\% does not appear in P(Bull) Scaled's top 5 at all.}
-\label{fig:drawdown-comparison}
-\end{figure}
-
-\begin{figure}[htbp]
-\centering
-% Placeholder for equity curves figure
-\fbox{\parbox{0.85\textwidth}{\centering\vspace{4cm}
-\textbf{Figure: Equity Curves Comparison (1986--2024)}\\[1em]
-Top panel: Linear scale cumulative returns.\\
-Middle panel: Log scale cumulative returns.\\
-Third panel: P(Bull) probability with bear regime shading.\\
-Fourth panel: Drawdown comparison.\\
-Bottom panel: Leverage over time for P(Bull) Scaled strategy.
-\vspace{4cm}}}
-\caption{Cumulative returns comparison on both linear and log scales. The P(Bull)-scaled strategy reduces exposure during high-volatility regimes, resulting in dramatically smaller drawdowns (21.1\% vs 46.2\% for HRP) while achieving superior long-term returns.}
-\label{fig:equity-curves}
-\end{figure}
-
-\subsection{Transaction Cost Impact}
-
-\paragraph{Forward-Looking Cost Assumptions.}
-This study assumes 10 basis points per trade and 50 basis points financing spread above the risk-free rate. These reflect \textit{current} institutional trading costs (e.g., Interactive Brokers Pro), not historical conditions. During the early decades of the sample (1970s--1990s), transaction costs were 10--50$\times$ higher due to fixed commissions, wider bid-ask spreads, and higher market impact. No attempt is made to replicate what would have happened under historical cost structures. Instead, the methodology tests whether \textit{historical market patterns}---regime shifts, correlation breakdowns, volatility clustering---would generate profitable signals if exploited with \textit{today's} trading infrastructure. The implicit assumption is that these patterns are structural features of equity markets that will recur in the future, making the strategy forward-implementable.
-
-\begin{table}[htbp]
-\centering
-\caption{Gross vs. Net Performance (10 bps Transaction Cost + 50 bps Financing Spread)}
-\label{tab:txcost}
-\begin{tabular}{lrrr}
-\toprule
-Strategy & Gross Sharpe & Net Sharpe & Sharpe Drag \\
-\midrule
-Buy \& Hold HRP & 0.53 & 0.51 & 0.02 \\
-P(Bull) Scaled & 0.87 & 0.85 & 0.02 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The regime-adaptive strategy incurs transaction costs from both HRP rebalancing (inner costs) and leverage adjustments (outer costs), plus financing spreads when leveraged. Despite these costs, it maintains a substantial performance advantage over static HRP.
-
-\begin{figure}[htbp]
-\centering
-% Placeholder for gross vs net figure
-\fbox{\parbox{0.85\textwidth}{\centering\vspace{3cm}
-\textbf{Figure: GROSS vs NET Returns Comparison}\\[1em]
-Equity curves showing the impact of transaction costs and financing spreads.\\
-The gap between GROSS and NET remains small, demonstrating practical implementability.
-\vspace{3cm}}}
-\caption{Comparison of GROSS returns (before costs) and NET returns (after 10 bps transaction costs and 50 bps financing spread). The Sharpe drag is modest at 0.02 for both strategies.}
-\label{fig:gross-vs-net}
-\end{figure}
-
-\subsection{Robustness Analysis}
-
-\paragraph{High-Volatility Period Performance.}
-During identified high-volatility (bear) regimes, the P(Bull)-scaled strategy reduces exposure:
-\begin{itemize}
-    \item Bear recall: 72.9\% of high-volatility months correctly identified
-    \item Reduced maximum drawdown: 21.1\% vs 46.2\% for static HRP
-    \item The strategy correctly predicted 70 of 96 bear months out-of-sample
-\end{itemize}
-
-\paragraph{Stability Across Subperiods.}
-To assess robustness, strategy performance is examined across different market environments:
-
-\begin{table}[htbp]
-\centering
-\caption{Subperiod Performance Analysis (P(Bull) Scaled Strategy)}
-\label{tab:subperiod}
-\begin{tabular}{lrrrr}
-\toprule
-Period & Ann. Return & Ann. Vol & Sharpe & Description \\
-\midrule
-1986--1999 & 13.2\% & 12.8\% & 0.72 & Tech boom \\
-2000--2009 & 5.8\% & 14.9\% & 0.12 & Dot-com \& GFC \\
-2010--2019 & 12.4\% & 11.2\% & 0.75 & Recovery \& expansion \\
-2020--2024 & 9.1\% & 15.8\% & 0.32 & COVID \& inflation \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The strategy demonstrates consistent positive Sharpe ratios across all subperiods, with particularly strong performance during the tech boom and post-GFC recovery. The challenging 2000--2009 period, which includes both the dot-com crash and the Global Financial Crisis, shows the strategy's defensive value: while absolute returns are modest, the strategy avoided the worst drawdowns through successful regime detection.
-
-\subsection{Economic Significance}
-
-To assess whether the observed outperformance is economically meaningful, the following factors are considered:
-
-\paragraph{Break-Even Transaction Costs.}
-The P(Bull)-scaled strategy generates approximately 0.34 Sharpe ratio improvement over static HRP. Given average annual turnover of approximately 35\% for the overlay (in addition to monthly HRP rebalancing), the strategy remains profitable up to transaction costs of approximately 100 bps per trade, well above the assumed 10 bps.
-
-\paragraph{Information Ratio.}
-Relative to the CRSP VW benchmark, the P(Bull)-scaled strategy achieves an information ratio of approximately 0.50, indicating consistent active returns relative to tracking error.
-
-\paragraph{Drawdown Reduction: The Primary Success Metric.}
-The most economically meaningful result is the dramatic reduction in drawdowns---not the Sharpe ratio improvement. While variance treats upside and downside equally, investors experience losses asymmetrically: a 50\% loss followed by a 50\% gain still leaves you down 25\%. The regime-adaptive strategy reduces maximum drawdown from 39.6\% (market) and 45.7\% (static HRP) to just 21.0\%---a 54\% reduction. More importantly, \textit{all five} of the strategy's worst drawdowns ($-$21.0\%, $-$17.8\%, $-$15.8\%, $-$14.6\%, $-$13.5\%) are smaller than HRP's \textit{fifth} worst ($-$22.3\%). The GFC drawdown that devastated HRP ($-$45.7\%, 2007--2009) does not even appear in P(Bull) Scaled's top 5.
-
-%==============================================================================
-% 7. CONCLUSION
-%==============================================================================
-\section{Conclusion}
-\label{sec:conclusion}
-
-This paper demonstrates that combining Hierarchical Risk Parity with machine learning-based regime prediction yields economically meaningful improvements in portfolio performance. The contributions include:
-
-\begin{enumerate}
-    \item A rigorous implementation of HRP with RMT denoising that outperforms traditional market-cap weighting
-    \item A 3-feature forward-only HMM filter (log returns, downside deviation, Michigan Consumer Sentiment) that identifies bull and bear regimes without look-ahead bias
-    \item An XGBoost regime prediction system with proper walk-forward validation and purged cross-validation
-    \item A complete transaction cost framework with asymmetric financing demonstrating practical implementability
-\end{enumerate}
-
-While the regime-adaptive strategy achieves a net Sharpe ratio of 0.85---a 57\% improvement over the CRSP value-weighted index (0.54) and 67\% over static HRP (0.51)---it is emphasized that \textbf{the reduction in drawdowns is the primary achievement}. Academic finance has long conflated volatility with risk, but practitioners know that drawdowns destroy wealth and investor confidence in ways that symmetric volatility does not. The strategy's five worst drawdowns ($-$21.0\% to $-$13.5\%) are all smaller than static HRP's \textit{fifth} worst ($-$22.3\%), and the catastrophic GFC drawdown ($-$45.7\%) is entirely absent from P(Bull) Scaled's top 5. This is not merely risk reduction---it is the difference between an investable strategy and a theoretical construct.
-
-\subsection{Limitations}
-
-Several limitations warrant mention:
-\begin{itemize}
-    \item The 2-state HMM identifies volatility regimes rather than directional market moves; both regimes have positive expected returns
-    \item While 66.2\% accuracy is reasonable, the 35.4\% precision on bear predictions means many false positives occur---the strategy errs on the side of caution
-    \item Results are sensitive to the 60-month lookback window for covariance estimation; shorter windows increase noise
-    \item The strategy's outperformance may partially reflect the specific sample period (1986--2024)
-    \item The Michigan Consumer Sentiment data has limited history pre-1978, affecting early HMM training
-\end{itemize}
-
-\subsection{Future Work}
-
-Promising extensions include:
-\begin{itemize}
-    \item Incorporating alternative data (sentiment, options-implied volatility) as additional features
-    \item Exploring 3-state HMMs to capture consolidation/transition regimes
-    \item Applying deep learning (LSTM/Transformer) for regime sequence modeling
-    \item Extending to international markets for diversification benefits
-\end{itemize}
-
-%==============================================================================
-% APPENDIX
-%==============================================================================
-\appendix
-\section{AI Tools and External Resources}
-\label{app:ai}
-
-The following AI tools and external resources were used in this project:
-
-\paragraph{AI Assistants:}
-\begin{itemize}
-    \item \textbf{GitHub Copilot} (Claude Opus 4.5): Code generation assistance, debugging, and documentation writing
-    \item Usage: Interactive coding sessions for implementing HRP algorithms, feature engineering, and visualization code
-\end{itemize}
-
-\paragraph{Libraries and Frameworks:}
-\begin{itemize}
-    \item \texttt{CuPy}: GPU-accelerated array operations (BSD License)
-    \item \texttt{hmmlearn}: Hidden Markov Model implementation (BSD License)
-    \item \texttt{XGBoost}: Gradient boosting (Apache 2.0 License)
-    \item \texttt{Optuna}: Hyperparameter optimization (MIT License)
-    \item \texttt{scipy.cluster.hierarchy}: Hierarchical clustering
-    \item \texttt{scikit-learn}: Cross-validation and metrics
-\end{itemize}
-
-\paragraph{Data Sources:}
-\begin{itemize}
-    \item CRSP (Center for Research in Security Prices): Licensed academic access
-    \item Compustat: Licensed academic access via WRDS
-    \item FRED (Federal Reserve Economic Data): Public domain
-    \item Kenneth French Data Library: Public academic resource
-\end{itemize}
-
-\paragraph{Reference Implementations:}
-\begin{itemize}
-    \item López de Prado's HRP algorithm adapted from \cite{lopez2016}
-    \item RMT denoising based on \cite{laloux1999} methodology
-    \item Purged cross-validation inspired by \cite{prado2018}
-\end{itemize}
-
-\section{Reproducibility}
-\label{app:reproduce}
-
-The complete codebase is available at the accompanying GitHub repository. To reproduce results:
-
-\begin{enumerate}
-    \item Install dependencies: \texttt{pip install -r requirements.txt}
-    \item Place data files in \texttt{DATA/} directory structure
-    \item Configure parameters in \texttt{config.yaml}
-    \item Run the Jupyter notebook: \texttt{CUDA-HRP-MULTIVAR-ML-V3.ipynb}
-\end{enumerate}
-
-Computation time on NVIDIA RTX GPU: approximately 2 minutes for full backtest (588 months).
 
 \section{Feature Formulas}
 \label{app:features}
@@ -1440,13 +1174,6 @@ Log ratio of median book-to-market ratios between value and growth quintiles:
 \end{equation}
 where $Q5$ is the top quintile (value) and $Q1$ is the bottom quintile (growth) sorted by book-to-market. Z-scored with 60-month window.
 
-\paragraph{Market RSI (\texttt{rsi}).}
-Relative Strength Index on value-weighted market returns:
-\begin{equation}
-    \text{RSI}_t = 100 - \frac{100}{1 + \frac{\bar{G}_{14}}{\bar{L}_{14}}}
-\end{equation}
-where $\bar{G}_{14}$ is the average of positive returns over 14 months and $\bar{L}_{14}$ is the average of absolute negative returns. Bounded $[0, 100]$, not Z-scored.
-
 \subsection*{Strategy Momentum Features}
 
 \paragraph{HRP Momentum 1M (\texttt{hrp\_mom\_1m\_z}).}
@@ -1466,6 +1193,30 @@ Z-scored with 24-month window.
     \text{Mom}_{12m,t} = \sum_{s=t-11}^{t} \ln(1 + r^{HRP}_s)
 \end{equation}
 12-month cumulative log return. Z-scored with 24-month window.
+
+\section{Drawdown Analysis}
+\label{app:drawdown-analysis}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/subsample_sharpe_stability.png}
+\caption{Sharpe ratio comparison across three subperiods. P(Bull) Scaled consistently outperforms both static HRP and CRSP VW in all subsamples, demonstrating robust performance across different market environments.}
+\label{fig:subsample-sharpe}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/subsample_equity_curves.png}
+\caption{Log-scale equity curves across three subperiods. Each panel shows cumulative returns for P(Bull) Scaled, Static HRP, and CRSP VW, illustrating consistent outperformance of the regime-adaptive strategy.}
+\label{fig:subsample-equity}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/drawdown_difference(1).png}
+\caption{Drawdown comparison between Static HRP and P(Bull) Scaled strategies. Top panel: Month-by-month drawdown difference---positive values indicate P(Bull) Scaled experienced smaller drawdowns. Bottom panel: Cumulative drawdown protection over time. While 26\% of months show P(Bull) with larger drawdowns, these periods are brief and shallow (max excess DD of $-$3.4\%), whereas protection during crises exceeds +39\% (GFC).}
+\label{fig:drawdown-diff}
+\end{figure}
 
 %==============================================================================
 % ACKNOWLEDGMENTS
