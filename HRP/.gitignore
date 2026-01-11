@@ -90,6 +90,11 @@ DATA/Compustat/compustat_selected_columns.csv
 # Super Agent Output (model outputs - keep tracked for reproducibility)
 # Super_Agent_Output/
 
+# Large data files (exceed GitHub 100MB limit)
+DATA/CRSP/CRSP_selected_columns.csv
+DATA/CRSP/CRSP_value_weighted_returns.csv
+DATA/Compustat/compustat_selected_columns.csv
+
 # Temporary files
 *.tmp
 *.bak
